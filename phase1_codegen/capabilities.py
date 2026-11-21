@@ -128,6 +128,8 @@ class LocalModelCapabilities:
     def _validated_payload(self, model_id, payload):
         if type(model_id) is not str or type(payload) is not dict:
             raise Rejected('model_call requires a model identifier and JSON object')
+        if model_id not in {row['id'] for row in self.manifest['models']}:
+            raise Rejected('model is not enabled in the configured capability catalog')
         payload = json_copy(payload, LIMITS['request_result_bytes'])
         if model_id in EMBEDDING_MODELS:
             texts = payload.get('texts')

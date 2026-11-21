@@ -38,4 +38,4 @@ include = ["evomem*", "phase1_codegen*", "math_apps_online*", "benchmarks*", "sc
 "benchmarks.math_apps" = ["math_pool_registration.json"]
 
 [tool.pytest.ini_options]
-testpaths = ["tests", "phase1_codegen/tests/test_local_service.py", "phase1_codegen/tests/test_tokenization.py", "phase1_codegen/tests/test_hooks.py", "phase1_codegen/tests/test_program_protocol.py", "math_apps_online/tests/test_native.py"]
+testpaths = ["tests", "phase1_codegen/tests/test_local_service.py", "phase1_codegen/tests/test_capabilities.py", "phase1_codegen/tests/test_tokenization.py", "phase1_codegen/tests/test_hooks.py", "phase1_codegen/tests/test_program_protocol.py", "math_apps_online/tests/test_native.py"]

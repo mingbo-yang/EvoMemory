@@ -29,8 +29,10 @@
     "synthetic": true
   },
   "total_verified_release_checks": {
-    "passed": 49,
-    "skipped": 2
+    "passed": 67,
+    "skipped": 2,
+    "subtests_passed": 102,
+    "scope": "Unique CPU checks across the original release selection, isolated judge, configured identity, and optional capability regressions"
   },
   "all_python_sources_compile": true,
   "cli_help_checked": [
@@ -51,6 +53,11 @@
   ],
   "added_configuration_contract": {
     "passed": 1,
+    "network_requests": 0
+  },
+  "added_optional_capability_contracts": {
+    "passed": 18,
+    "subtests_passed": 45,
     "network_requests": 0
   }
 }

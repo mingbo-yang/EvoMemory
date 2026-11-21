@@ -15,6 +15,19 @@ from phase1_codegen import local_service
 
 
 class ReleaseTests(unittest.TestCase):
+    def test_disabled_auxiliary_models_are_absent_and_cannot_be_called(self):
+        from phase1_codegen import capabilities
+        from phase1_codegen.policy import Rejected
+        tokens=type('Tokens',(),{'count':lambda self,s:len(s)})()
+        with TemporaryDirectory() as tmp, patch.dict(os.environ,{'EVOMEMORY_ENABLE_OPTIONAL_MODELS':'0'}), \
+                patch.object(capabilities,'_manifest',side_effect=AssertionError('unexpected model access')):
+            pool=capabilities.LocalModelCapabilities(Path(tmp),'math',Path(tmp)/'costs.jsonl',tokens,
+                'synthetic-model','http://127.0.0.1:8140/v1')
+            self.assertEqual([r['id'] for r in pool.describe()['models']],[capabilities.GENERATION_MODEL])
+            with self.assertRaises(Rejected):
+                pool._validated_payload('multilingual-e5-small',{'texts':['synthetic']})
+            pool.close()
+
     def test_configured_model_and_endpoint_import_without_a_service(self):
         env=dict(os.environ,EVOMEMORY_MODEL_NAME='release-fixture-local',
                  EVOMEMORY_BASE_URL='http://127.0.0.1:18410/v1')
