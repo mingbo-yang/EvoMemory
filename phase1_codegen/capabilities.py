@@ -28,7 +28,7 @@ EMBEDDING_MODELS = {
                        / 'snapshots/c9745ed1d9f207416be6d2e6f8de32d1f16199bf', 384, 256),
     'sentence-t5-base': (MODEL_ROOT / 'sentence-t5-base', 768, 256),
 }
-GENERATION_MODEL = 'qwen3.8-27b-local'
+GENERATION_MODEL = MODEL_NAME
 MULTIMODAL_MODEL = 'qwen3.5-0.8b-local'
 MULTIMODAL_PATH = MODEL_ROOT / 'qwen3.5-0.8b/model'
 API_VERSION = 'local-model-json-v1'

@@ -29,7 +29,7 @@
     "synthetic": true
   },
   "total_verified_release_checks": {
-    "passed": 48,
+    "passed": 49,
     "skipped": 2
   },
   "all_python_sources_compile": true,
@@ -48,5 +48,9 @@
     "No clean optional TextWorld/MLLM installation check",
     "GitHub CI not yet run",
     "Original full research test collection not completed"
-  ]
+  ],
+  "added_configuration_contract": {
+    "passed": 1,
+    "network_requests": 0
+  }
 }

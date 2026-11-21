@@ -50,7 +50,7 @@ Use **Linux and Python 3.10 or 3.11**. The isolation layer requires `libseccomp`
 there is no unrestricted execution fallback.
 
 ```bash
-git clone git@github.com:mingbo-yang/EvoMemory.git
+git clone https://github.com/mingbo-yang/EvoMemory.git
 cd EvoMemory
 python3.10 -m venv .venv
 source .venv/bin/activate

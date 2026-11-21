@@ -1,7 +1,10 @@
 """Release contracts: checkpoint identity, explicit configuration, and portable adapters."""
 import importlib
 import json
+import os
 from pathlib import Path
+import subprocess
+import sys
 from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
@@ -12,6 +15,16 @@ from phase1_codegen import local_service
 
 
 class ReleaseTests(unittest.TestCase):
+    def test_configured_model_and_endpoint_import_without_a_service(self):
+        env=dict(os.environ,EVOMEMORY_MODEL_NAME='release-fixture-local',
+                 EVOMEMORY_BASE_URL='http://127.0.0.1:18410/v1')
+        code=('from phase1_codegen.capabilities import GENERATION_MODEL; '
+              'from phase1_codegen.local_service import validate_base_url; '
+              'from evomem.common import BASE_URL; '
+              'assert GENERATION_MODEL == "release-fixture-local"; '
+              'assert validate_base_url(BASE_URL) == "http://127.0.0.1:18410/v1"')
+        subprocess.run([sys.executable,'-B','-c',code],env=env,check=True,capture_output=True,text=True)
+
     def test_checkpoint_registration_verifies_bytes_and_never_overwrites(self):
         with TemporaryDirectory() as tmp:
             root=Path(tmp);model=root/'checkpoint';model.mkdir()
