@@ -1,0 +1,46 @@
+{
+  "schema": 1,
+  "benchmark": "Hendrycks et al., Measuring Mathematical Problem Solving With the MATH Dataset, NeurIPS Datasets and Benchmarks 2021",
+  "upstream": {
+    "repository": "hendrycks/math",
+    "commit": "985bdc1696e88e8643f081a0ff4719da39f2ae2a",
+    "paper": "https://datasets-benchmarks-proceedings.neurips.cc/paper/2021/hash/be83ab3ecd0db773eb2dc1b0a17836a1-Abstract-round2.html"
+  },
+  "publish": {
+    "repository": "EleutherAI/hendrycks_math",
+    "revision": "21a5633873b6a120296cce3e2df9d5550074f4a3",
+    "shards": [
+      {
+        "family": "algebra",
+        "split": "train",
+        "rows": 1744,
+        "bytes": 505186,
+        "sha256": "73347f5b55869f21ff094361025dbd12d291e971aa4d72142eacee10438e449f"
+      },
+      {
+        "family": "algebra",
+        "split": "test",
+        "rows": 1187,
+        "bytes": 353114,
+        "sha256": "0e04a850dac9cfc758eac0c80afd2d0cc65e29ea72f916c8ac1045b12af937f5"
+      },
+      {
+        "family": "number_theory",
+        "split": "train",
+        "rows": 869,
+        "bytes": 308653,
+        "sha256": "81c08649149b39811f2d1d7ddf5dfccf6c4c8044a2e169cfb24db09160c941f4"
+      },
+      {
+        "family": "number_theory",
+        "split": "test",
+        "rows": 540,
+        "bytes": 182003,
+        "sha256": "ba156c9c9fa2040836ba12135fd964e6e67d6bccd8c469ec4a3ad941f8f6fbe9"
+      }
+    ]
+  },
+  "eligibility": "All official levels 1, 2, 3, 4 and 5; original plain text questions excluding Asymptote/embedded graphics; filter only gold presentation, never model performance. Require exactly one explicit boxed answer in the published reference, whose contents form a signed decimal integer, optionally with correctly grouped thousands. Remove all occurrences of duplicate whitespace-normalized question text across all four source shards before allocation. Keep difficulty and subject labels. Samples are selected externally. Prior pilot task IDs are not implicitly removed.",
+  "scoring": "Last explicit model box must contain an integer; normalize sign, leading zeros and well-formed comma separators; compare canonical exact strings. No float conversion, rounding, symbolic guessing or last-number fallback. A completed response with missing or malformed answer scores zero; a missing completion is unmeasured. Report subset and output rule alongside results; not a full MATH score.",
+  "private_scope": "Only the scoring host may read archive shards, worked solutions and extracted gold. The Actor-facing API returns id, group, family, split, level and public prompt. Raw official test solutions are machine processed to authenticate format/score, never sent to Actor/Reviewer/Evolver; no evaluation outcome selects a task."
+}

@@ -1,0 +1,52 @@
+{
+  "release": "0.1.0",
+  "source_checkout": "evolution_memory_phase1_dev_20261107",
+  "original_runtime_source_unchanged": true,
+  "semantic_preservation": {
+    "phase1_codegen/engine.py": true,
+    "phase1_codegen/review.py": true,
+    "phase1_codegen/proposer.py": true,
+    "phase1_codegen/experience.py": true,
+    "phase1_codegen/acceptance.py": true,
+    "phase1_codegen/protocol.py": true,
+    "phase1_codegen/policy.py": true,
+    "phase1_codegen/program.py": true,
+    "evomem/alma_backend.py": true,
+    "math_apps_online/search.py": true,
+    "math_apps_online/decision.py": true,
+    "math_apps_online/online.py": true,
+    "benchmarks/math_apps/math_tasks.py grading AST unchanged": true,
+    "benchmarks/math_apps/apps_tasks.py grading AST unchanged": true
+  },
+  "default_release_suite": {
+    "passed": 47,
+    "skipped": 2,
+    "subtests_passed": 57,
+    "skipped_reason": "separately installed real tokenizer checkpoint absent"
+  },
+  "added_judge_contract": {
+    "passed": 1,
+    "synthetic": true
+  },
+  "total_verified_release_checks": {
+    "passed": 48,
+    "skipped": 2
+  },
+  "all_python_sources_compile": true,
+  "cli_help_checked": [
+    "math_apps_online",
+    "phase1_codegen",
+    "scripts.prepare_assets"
+  ],
+  "wheel_build": "successful; rebuilt after final source/doc changes",
+  "full_research_suite_completed": false,
+  "new_model_calls": 0,
+  "new_native_benchmark_rollouts": 0,
+  "machine_specific_scheduling_removed": true,
+  "benchmark_data_or_weights_distributed": false,
+  "limitations": [
+    "No clean optional TextWorld/MLLM installation check",
+    "GitHub CI not yet run",
+    "Original full research test collection not completed"
+  ]
+}

@@ -1,0 +1,55 @@
+flowchart TB
+  S["范围：同一数据集内跨任务类型<br/>不同数据集的代码、Task Memory、Evolution Memory 独立"]
+  subgraph A["① 任务执行与持续学习"]
+    T["当前学习任务：源类型 / 目标类型"] --> X["Executor：原 ALMA<br/>固定推理、动作生成与执行预算"]
+    X <-->|"动作 / 原生观测与奖励"| ENV["原生任务环境"]
+    X <-->|"可见事件 / 记忆上下文"| H["固定 Memory Hook<br/>task_start / before_action<br/>after_observation / task_end"]
+    H <-->|"调用 / 响应"| M["可进化的 Memory Mechanism<br/>on_event(state,event,context)<br/>自主决定如何处理记忆、何时响应事件"]
+    M <-->|"读取 / 学习任务验证后提交"| TM[("Task Memory<br/>真实经历与持久状态")]
+  end
+  S --> T
+  subgraph B["② 固定机制进化流程"]
+    F["固定当前代码、真实记忆与学习前沿<br/>父机制原生验证及记忆存取诊断"]
+    PRE["Reviewer：修改前诊断<br/>当前机制＋当前真实证据；只评审不写代码"]
+    E["Fixed Evolver：唯一代码作者<br/>当前源码、初审、日志、检索的修改经验<br/>续轮携上一草稿、最新验证和后评审<br/>自主编写完整候选机制"]
+    EM[("Evolution Memory<br/>机制修改经验；固定构建与检索")]
+    V{"语法、接口、沙箱、资源检查<br/>同一学习经历重放通过？"}
+    Q["同一 Executor：原生候选验证<br/>父候选同任务、种子和预算；只读"]
+    POST["同一个 Reviewer：修改后评审<br/>先获取父候选代码、精确得分、关键日志<br/>实际记忆读写和注入、成本等证据<br/>再给出质量意见"]
+    F --> PRE --> E --> V
+    EM -->|"固定检索，仅供 Evolver"| E
+    V -->|"通过"| Q -->|"真实验证证据"| POST
+    V -->|"失败：保留失败证据；不运行候选原生任务"| POST
+  end
+  A --> F
+  subgraph C["③ 采纳与修改经验积累"]
+    G{"固定规则：全部满足<br/>机制有效且执行完整<br/>Reviewer 积极<br/>候选得分 > 0 且严格高于父机制"}
+    Y["采纳：原子替换机制代码与重放状态"]
+    N["未采纳：保留当前代码及已提交的学习状态"]
+    AR["每次候选均归档：成功、未采纳、无效<br/>代码差异、验证、规范意见和成本"]
+    NX["阶段预算结束：转入下一任务 / 类型<br/>继承当前代码与两类记忆；耗尽仍不满足则不采纳"]
+    G -->|"全部满足"| Y --> AR
+    G -->|"任一不满足"| N --> AR
+    AR --> NX
+  end
+  POST --> G
+  AR -->|"追加机制修改经验"| EM
+  AR -.->|"候选预算内，以当前机制继续下一轮"| F
+  NX -.->|"继续学习阶段"| T
+  NX -->|"全部阶段结束"| FINAL["④ 独立留出评估<br/>固定最终机制、同一 Executor 和原生指标；只读<br/>结果不回流 Reviewer、Evolver 或两类记忆"]
+
+  classDef executor fill:#EAF2FD,stroke:#477BB7,color:#243347;
+  classDef reviewer fill:#FFF3DA,stroke:#AF8125,color:#243347;
+  classDef evolver fill:#F0EAFF,stroke:#8560B2,color:#243347;
+  classDef taskmem fill:#E8F5ED,stroke:#438266,color:#243347;
+  classDef evomem fill:#E6F5F7,stroke:#3E858B,color:#243347;
+  class X,ENV,Q,FINAL executor;
+  class PRE,POST reviewer;
+  class E evolver;
+  class M,TM,Y taskmem;
+  class EM evomem;
+
+%% Reviewer sees current implementation evidence; historical design records go to Evolver.
+%% Qualitative opinion and native score are distinct; neither alone deploys code.
+%% Every Evolver proposal counts toward one bounded candidate budget.
+%% No new agent, memory layer, Executor policy, or prescribed memory design is introduced.

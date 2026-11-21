@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "evomemory-research"
+version = "0.1.0"
+description = "Code evolution of agent memory mechanisms with structured evolution experience"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [{name = "Mingbo Yang"}]
+dependencies = [
+  "httpx>=0.27,<1", "openai>=1.40,<4", "requests>=2.31,<3",
+  "rich>=13,<15", "jsonschema>=4.20,<5", "PyYAML>=6,<7",
+  "python-dotenv>=1,<2", "colorlog>=6,<7", "scipy>=1.10,<2"
+]
+
+[project.optional-dependencies]
+models = ["transformers>=4.51,<6", "torch>=2.2", "sentence-transformers>=3,<6", "Pillow>=10"]
+data = ["pyarrow>=14"]
+alfworld = ["alfworld==0.4.2", "textworld==1.7.0"]
+dev = ["pytest>=8,<10", "build>=1.2", "twine>=5"]
+
+[project.scripts]
+evomemory = "math_apps_online.__main__:main"
+evomemory-campaign = "phase1_codegen.campaign:main"
+
+[project.urls]
+Repository = "https://github.com/mingbo-yang/EvoMemory"
+Issues = "https://github.com/mingbo-yang/EvoMemory/issues"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["evomem*", "phase1_codegen*", "math_apps_online*", "benchmarks*", "scripts*"]
+
+[tool.setuptools.package-data]
+"benchmarks.math_apps" = ["math_pool_registration.json"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests", "phase1_codegen/tests/test_local_service.py", "phase1_codegen/tests/test_tokenization.py", "phase1_codegen/tests/test_hooks.py", "phase1_codegen/tests/test_program_protocol.py", "math_apps_online/tests/test_native.py"]

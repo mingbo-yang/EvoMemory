@@ -1,0 +1,77 @@
+digraph EvoMemory {
+  graph [rankdir=TB, bgcolor="white", pad="0.30", nodesep="0.40", ranksep="0.48",
+    fontname="Noto Sans CJK SC", fontsize=23, labelloc=t, compound=true,
+    label="EvoMemory · 记忆机制自主进化\n同一数据集内跨任务类型；不同数据集的代码与两类记忆独立"];
+  node [shape=box, style="rounded,filled", fillcolor="#F4F6F9", color="#8996A6",
+    fontname="Noto Sans CJK SC", fontsize=12, margin="0.18,0.12", penwidth=1.25];
+  edge [fontname="Noto Sans CJK SC", fontsize=10, color="#667487", arrowsize=0.75, penwidth=1.1];
+
+  subgraph cluster_execution {
+    label="① 任务执行与 Task Memory 积累"; color="#B9CDE6"; style=rounded; fontsize=17;
+    learning [label="当前任务\n源任务类型 / 目标任务类型"];
+    executor [label="Executor · 原 ALMA 执行器\n基础模型、推理和动作规则固定", fillcolor="#E9F1FC", color="#477BB7"];
+    environment [label="原生环境\n观测、奖励与终止状态", fillcolor="#E9F1FC", color="#477BB7"];
+    hook [label="固定 Memory Hook\ntask_start · before_action\nafter_observation · task_end"];
+    mechanism [label="可进化的 Memory Mechanism\non_event(state, event, context)\n自主决定如何处理记忆、何时响应事件\n可选调用本地模型", fillcolor="#E8F5ED", color="#438266"];
+    taskmemory [shape=cylinder, label="Task Memory\n当前机制管理的经历与持久状态", fillcolor="#E8F5ED", color="#438266"];
+    {rank=same; learning; executor; environment;}
+    {rank=same; hook; mechanism; taskmemory;}
+    learning -> executor;
+    executor -> environment [label="动作 / 原生反馈", dir=both];
+    executor -> hook [label="可见事件 / 记忆上下文", dir=both];
+    hook -> mechanism [label="调用 / 响应", dir=both];
+    mechanism -> taskmemory [label="读状态 / 验证后提交", dir=both];
+    execution_note [shape=plaintext, style="", fontsize=11,
+      label="仅指定学习任务在执行和证据检查通过后提交状态；父候选比较与留出评估只读。"];
+    hook -> execution_note [style=invis];
+    mechanism -> execution_note [style=invis];
+    taskmemory -> execution_note [style=invis];
+  }
+
+  subgraph cluster_evolution {
+    label="② 固定机制进化流程：Reviewer 评审，Evolver 编写代码"; color="#CFC1E3"; style=rounded; fontsize=17;
+    frontier [label="固定当前代码、实际 Task Memory 与学习前沿\n父机制原生验证＋记忆存储 / 检索 / 注入诊断"];
+    pre [label="Reviewer · 修改前诊断\n评审当前机制与当前真实证据\n不编写机制代码", fillcolor="#FFF3DA", color="#B0842C"];
+    evolver [label="Fixed Evolver · 唯一代码作者\n读取当前源码、初审、日志、修改经验\n及上一候选的最新验证反馈\n自主编写完整候选机制", fillcolor="#F0EAFF", color="#875FB5"];
+    em [shape=cylinder, label="Evolution Memory\n机制修改经验：差异、结果、评审元信息\n固定构建与检索，不随机制代码进化", fillcolor="#E5F5F7", color="#43868B"];
+    {rank=same; pre; evolver; em;}
+    frontier -> pre;
+    pre -> evolver [label="有证据依据的诊断"];
+    em -> evolver [label="固定检索", color="#43868B"];
+
+    check [shape=diamond, label="语法 / 接口 / 沙箱 / 资源检查\n同一学习经历重放通过？", fontsize=11];
+    validate [label="同一 Executor · 原生配对验证\n父候选：相同任务、种子、执行预算\n只读执行，记录得分与真实轨迹", fillcolor="#E9F1FC", color="#477BB7"];
+    post [label="同一个 Reviewer · 修改后评审\n先看新机制和验证结果，再给质量意见\n父候选代码、精确得分、关键日志\n记忆读写 / 实际注入 / 成本证据", fillcolor="#FFF3DA", color="#B0842C"];
+    {rank=same; check; validate; post;}
+    evolver -> check [label="候选代码"];
+    check -> validate [label="通过"];
+    check -> post [label="未通过：提供失败证据\n不执行候选原生任务", style=dashed];
+    validate -> post [label="真实验证证据"];
+    frontier -> post [label="父机制证据", style=dashed, constraint=false];
+
+    gate [shape=diamond, label="固定采纳规则：全部满足\n候选有效且执行完整\nReviewer 积极\n候选得分 > 0 且严格高于父机制", fillcolor="#EDF1F5", color="#5E6E82", fontsize=12];
+    post -> gate;
+    accept [label="采纳\n原子替换机制代码与重放后的记忆状态", fillcolor="#E8F5ED", color="#438266"];
+    reject [label="未采纳\n保留当前部署代码和已提交的学习状态"];
+    {rank=same; accept; reject;}
+    gate -> accept [label="全部满足", color="#438266"];
+    gate -> reject [label="任一不满足"];
+    archive [label="归档每次提案\n采纳、未采纳、无效均记录；保留证据与成本\n最新草稿＋原生验证＋规范评审供下一次修改"];
+    accept -> archive;
+    reject -> archive;
+    archive -> em [label="追加机制修改经验", color="#43868B", constraint=false];
+    archive:w -> frontier:w [label="尚有候选预算：继续迭代\n所有提案统一计数", style=dashed, color="#875FB5", constraint=false];
+  }
+  execution_note -> frontier;
+
+  next [label="本阶段预算结束 → 下一任务 / 任务类型\n同数据集内继承当前代码与两类记忆"];
+  final_eval [label="③ 全部学习 / 进化阶段结束：独立留出评估\n固定最终机制；同一 Executor 与原生指标；只读\n结果不反馈 Reviewer、Evolver 或两类记忆", fillcolor="#E9F1FC", color="#477BB7"];
+  archive -> next [label="继续学习阶段"];
+  archive -> final_eval [label="全部阶段结束", style=dashed];
+  next:w -> learning:w [label="持续积累", style=dashed, constraint=false, color="#438266"];
+  {rank=same; next; final_eval;}
+  note [shape=plaintext, style="", fontsize=11,
+    label="角色与证据边界：Executor 执行 · Reviewer 前后评审 · Evolver 修改机制 · 固定规则决定采纳\n修改经验供 Evolver 使用；Reviewer 聚焦当前证据。意见与得分有分歧时，在既定预算内继续；耗尽仍不满足则不采纳。\n图示为当前实现流程，不代表已证明跨任务类型收益。  |  workflow v4 · memory-events-v1"];
+  next -> note [style=invis];
+  final_eval -> note [style=invis];
+}
