@@ -1,5 +1,5 @@
 """One fixed Reviewer for the online question. An initial diagnosis, then one decision per candidate."""
-from phase1_codegen.review import MechanismReviewer, REVIEW_RUBRIC, candidate_validation_summary
+from phase1_codegen.roles.reviewer import MechanismReviewer, REVIEW_RUBRIC, candidate_validation_summary
 
 
 ONLINE_REVIEW_PROMPT = """You are the fixed Reviewer for one online memory-mechanism repair.

@@ -5,7 +5,7 @@ type: software
 authors:
   - family-names: Yang
     given-names: Mingbo
-version: 0.1.0
+version: 0.2.0
 date-released: 2026-11-21
 url: "https://github.com/mingbo-yang/EvoMemory"
 license: MIT

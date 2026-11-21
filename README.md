@@ -131,15 +131,21 @@ See [online protocol](docs/online_protocol.md),
 
 | Directory | Purpose |
 |---|---|
-| `phase1_codegen/` | Event contract, memory programs, Reviewer, Evolver, isolation, evidence, adoption |
+| `phase1_codegen/roles/` | Fixed Reviewer and Evolver implementations |
+| `phase1_codegen/reporting/` | Offline experiment reports |
+| `phase1_codegen/` | Event contract, memory execution, evidence, orchestration, adoption |
 | `math_apps_online/` | Transactional online task-stream scheduling and reporting |
 | `evomem/` | ALMA/model transport and common infrastructure |
 | `benchmarks/` | Pinned MATH/APPS and CrossEp-Emb adapters and host-side judging |
 | `scripts/` | Explicit checkpoint registration and upstream asset preparation |
-| `tests/` and package tests | CPU contracts; fixtures are synthetic unless stated otherwise |
+| `tests/core/`, `tests/online/`, and release tests | CPU contracts, separate from installed runtime code |
 | `docs/` | Method, setup, protocol, and release limitations |
 
 ## Tests and evidence
+
+See the [architecture and code map](docs/architecture.md) for module ownership,
+entry points, and the full development-test commands. Workflow documentation is
+maintained under `docs/` rather than duplicated inside runtime packages.
 
 ```bash
 python -m pytest -q

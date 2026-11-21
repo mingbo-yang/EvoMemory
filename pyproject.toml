@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "evomemory-research"
-version = "0.1.0"
+version = "0.2.0"
 description = "Code evolution of agent memory mechanisms with structured evolution experience"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -20,7 +20,7 @@ dependencies = [
 models = ["transformers>=4.51,<6", "torch>=2.2", "sentence-transformers>=3,<6", "Pillow>=10"]
 data = ["pyarrow>=14"]
 alfworld = ["alfworld==0.4.2", "textworld==1.7.0"]
-dev = ["pytest>=8,<10", "build>=1.2", "twine>=5"]
+dev = ["pytest>=8,<10", "build>=1.2", "twine>=5", "Pillow>=10"]
 
 [project.scripts]
 evomemory = "math_apps_online.__main__:main"
@@ -33,9 +33,19 @@ Issues = "https://github.com/mingbo-yang/EvoMemory/issues"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["evomem*", "phase1_codegen*", "math_apps_online*", "benchmarks*", "scripts*"]
+exclude = ["tests*"]
 
 [tool.setuptools.package-data]
 "benchmarks.math_apps" = ["math_pool_registration.json"]
 
 [tool.pytest.ini_options]
-testpaths = ["tests", "phase1_codegen/tests/test_local_service.py", "phase1_codegen/tests/test_capabilities.py", "phase1_codegen/tests/test_tokenization.py", "phase1_codegen/tests/test_hooks.py", "phase1_codegen/tests/test_program_protocol.py", "math_apps_online/tests/test_native.py"]
+testpaths = [
+  "tests/test_release.py",
+  "tests/test_import_boundaries.py",
+  "tests/core/test_local_service.py",
+  "tests/core/test_capabilities.py",
+  "tests/core/test_tokenization.py",
+  "tests/core/test_hooks.py",
+  "tests/core/test_program_protocol.py",
+  "tests/online/test_native.py",
+]

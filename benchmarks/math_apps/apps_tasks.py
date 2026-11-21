@@ -3,14 +3,10 @@ import ast
 from functools import lru_cache
 import json
 import math
-from pathlib import Path
-import sys
 
 from .paths import ASSETS
 HERE=ASSETS
 ARCHIVE=HERE/'apps_archive'
-PILOT=Path(__file__).resolve().parent
-if str(PILOT) not in sys.path:sys.path.append(str(PILOT))
 from .code_sandbox import grade_stdio, source_of
 
 

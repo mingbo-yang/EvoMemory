@@ -701,7 +701,7 @@ class EvolutionEngine:
         return references
 
     def _review(self, payload, index, directory):
-        from .review import validate_report
+        from phase1_codegen.roles.reviewer import validate_report
         stage = payload['stage']
         path = directory / (stage + '_review.json')
         if path.exists():
@@ -735,7 +735,7 @@ class EvolutionEngine:
         return receipt
 
     def _check_review_receipt(self, receipt):
-        from .review import validate_report
+        from phase1_codegen.roles.reviewer import validate_report
         if digest(receipt.get('report')) != receipt['report_hash']:
             raise RuntimeError('Review report changed')
         original = read(self.store.root / receipt['input_path'])
@@ -859,7 +859,7 @@ class EvolutionEngine:
                 raise RuntimeError('Previous execution evidence changed')
             behavior = saved['candidate']
             behavior_comparison = observed_behavior_comparison(saved['parent'], saved['candidate'])
-        from .review import historical_native_execution
+        from phase1_codegen.roles.reviewer import historical_native_execution
         native_execution = historical_native_execution(review_input.get('evidence', []),
                                                       review_shown.get('evidence', []), self.tokenizer)
         snapshot = trial.get('task_memory_evaluation') or {}

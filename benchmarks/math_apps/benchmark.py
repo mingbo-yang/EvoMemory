@@ -1,18 +1,12 @@
 """One-turn benchmark adapter for the production evolution engine."""
 import asyncio
-import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 PROJECT = HERE.parents[1]
 PILOT = HERE
 from .paths import ASSETS
-sys.path.insert(0, str(PROJECT))
-# Only the pinned one-turn Actor transport is shared with calibration.
-from importlib.util import module_from_spec, spec_from_file_location
-spec = spec_from_file_location('single_turn_actor', PILOT / 'actor.py')
-actor = module_from_spec(spec)
-spec.loader.exec_module(actor)
+from . import actor
 
 from evomem.common import MODEL_NAME, digest, file_hash, read, write
 from phase1_codegen.campaign import bind
@@ -25,11 +19,7 @@ from phase1_codegen.program import WorkerStartupError
 from phase1_codegen.protocol import ONE_TURN_EXECUTOR as EXECUTOR
 
 WORKERS = 2
-# The isolated APPS judge's language surface is public; freeze it for both arms.
-actor.PROMPTS['code'] += (' Use built-ins or these supported Python modules: array, bisect, collections, copy,'
-                          ' decimal, fractions, functools, heapq, io, itertools, json, math, operator, random,'
-                          ' re, statistics, string, sys, typing. Read and write through standard streams'
-                          ' for standard-I/O submissions.')
+
 
 
 class BenchmarkEvaluator:

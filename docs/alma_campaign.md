@@ -54,10 +54,10 @@ def on_event(state, event, context):
 | `hook_adapter.py` | 围绕原 ALMA 循环发送事件、接入同一记忆槽 |
 | `native.py` / `textworld_native.py` | 环境启动和原生结果；复用公共记忆收尾与请求证据绑定 |
 | `engine.py` | 学习、诊断、提案、验证、评审与采纳的编排 |
-| `proposer.py` / `review.py` / `acceptance.py` | 分离的生成、评价和固定采纳规则 |
+| `roles/evolver.py` / `roles/reviewer.py` / `acceptance.py` | 分离的生成、评价和固定采纳规则 |
 | `learning.py` / `store.py` | 已提交学习前沿、历史版本及恢复一致性 |
 | `experience.py` | 固定的 Evolution Memory 构建与检索 |
-| `campaign.py` / `campaign_report.py` | 唯一活动实验入口及证据报告 |
+| `campaign.py` / `reporting/campaign.py` | 活动实验入口及离线证据报告 |
 
 单次沙箱检查与宿主检查、当前执行与恢复校验跨越不同信任边界，需要保留。去重主要针对同一职责的重复实现，不合并证据与评价、提案与采纳等不同职责。
 

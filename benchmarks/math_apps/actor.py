@@ -19,6 +19,12 @@ PROMPTS = {
     'code': 'Solve the programming problem in Python 3. Respect the requested function signature or input/output format. Return only your complete program in a single python code block.',
 }
 
+# The isolated APPS judge's language surface is public; freeze it for both arms.
+PROMPTS['code'] += (' Use built-ins or these supported Python modules: array, bisect, collections, copy,'
+                          ' decimal, fractions, functools, heapq, io, itertools, json, math, operator, random,'
+                          ' re, statistics, string, sys, typing. Read and write through standard streams'
+                          ' for standard-I/O submissions.')
+
 def messages_for(domain, prompt, slot):
     system = PROMPTS[domain] + '\n\nPrevious task memory:\n' + json.dumps(slot, ensure_ascii=False)
     return [dict(role='system',content=system),dict(role='user',content=prompt)]

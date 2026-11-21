@@ -1,0 +1,155 @@
+{
+  "version": "0.2.0",
+  "base_commit": "e08a443",
+  "scope": "Structural cleanup in the public checkout only",
+  "module_moves": {
+    "phase1_codegen/review.py": "phase1_codegen/roles/reviewer.py",
+    "phase1_codegen/proposer.py": "phase1_codegen/roles/evolver.py",
+    "phase1_codegen/campaign_report.py": "phase1_codegen/reporting/campaign.py"
+  },
+  "test_moves": {
+    "phase1_codegen/tests/": "tests/core/",
+    "math_apps_online/tests/": "tests/online/"
+  },
+  "duplicate_documents_removed": [
+    "phase1_codegen/README.md",
+    "math_apps_online/README.md"
+  ],
+  "canonical_workflow_documents": [
+    "docs/alma_campaign.md",
+    "docs/online_protocol.md"
+  ],
+  "prompt_and_protocol_contracts_unchanged": [
+    "review_prompt",
+    "evolver_prompt",
+    "online_review_prompt",
+    "online_evolver_prompt",
+    "actor_prompts",
+    "actor_parameters",
+    "alma_actor_parameters",
+    "reviewer_parameters",
+    "evolver_parameters",
+    "event_contract",
+    "hook_version",
+    "workflow_version"
+  ],
+  "protocol_contract_sha256": "08558b902e33420e5a5fb1b1ed09a7c3952c2ad2931f1db91e52cf71247bf759",
+  "business_ast_checks": {
+    "phase1_codegen/roles/reviewer.py": {
+      "scope": "all non-import AST nodes",
+      "unchanged": true
+    },
+    "phase1_codegen/roles/evolver.py": {
+      "scope": "all non-import AST nodes",
+      "unchanged": true
+    },
+    "phase1_codegen/reporting/campaign.py": {
+      "scope": "all non-import AST nodes",
+      "unchanged": true
+    },
+    "phase1_codegen/engine.py": {
+      "scope": "all non-import AST nodes",
+      "unchanged": true
+    },
+    "phase1_codegen/store.py": {
+      "scope": "all non-import AST nodes",
+      "unchanged": true
+    },
+    "phase1_codegen/acceptance.py": {
+      "scope": "all non-import AST nodes",
+      "unchanged": true
+    },
+    "phase1_codegen/protocol.py": {
+      "scope": "all non-import AST nodes",
+      "unchanged": true
+    },
+    "phase1_codegen/experience.py": {
+      "scope": "all non-import AST nodes",
+      "unchanged": true
+    },
+    "math_apps_online/decision.py": {
+      "scope": "all non-import AST nodes",
+      "unchanged": true
+    },
+    "math_apps_online/search.py": {
+      "scope": "all non-import AST nodes",
+      "unchanged": true
+    },
+    "math_apps_online/online.py": {
+      "scope": "all non-import AST nodes",
+      "unchanged": true
+    },
+    "benchmarks/math_apps/apps_tasks.py": {
+      "scope": "function and class bodies; module import/prompt ownership intentionally changed",
+      "unchanged": true
+    },
+    "benchmarks/math_apps/benchmark.py": {
+      "scope": "function and class bodies; module import/prompt ownership intentionally changed",
+      "unchanged": true
+    },
+    "benchmarks/math_apps/actor.py": {
+      "scope": "function and class bodies; module import/prompt ownership intentionally changed",
+      "unchanged": true
+    }
+  },
+  "tests": {
+    "unique_passed": 187,
+    "skipped": 2,
+    "default_suite": {
+      "passed": 68,
+      "skipped": 2,
+      "collection_count": 70,
+      "worker_path_regression_fixed": true
+    },
+    "role_report_and_online_components": {
+      "passed": 109,
+      "synthetic_transport_tokenizer_used": true
+    },
+    "baseline_reuse_additional": {
+      "passed": 10
+    },
+    "all_development_contracts_collected": 516,
+    "full_development_suite_executed": false,
+    "scopes": [
+      "tests/core/test_baseline_reuse.py",
+      "tests/core/test_baseline_reuse_report.py",
+      "tests/core/test_capabilities.py",
+      "tests/core/test_capability_report.py",
+      "tests/core/test_current_campaign_contract.py",
+      "tests/core/test_engine.py",
+      "tests/core/test_functional_review.py",
+      "tests/core/test_hooks.py",
+      "tests/core/test_indexed_review.py",
+      "tests/core/test_local_service.py",
+      "tests/core/test_program_protocol.py",
+      "tests/core/test_review.py",
+      "tests/core/test_review_budget.py",
+      "tests/core/test_review_contract.py",
+      "tests/core/test_review_delivery.py",
+      "tests/core/test_review_rubric.py",
+      "tests/core/test_tokenization.py",
+      "tests/online/test_native.py",
+      "tests/online/test_search.py",
+      "tests/online/test_stream.py",
+      "tests/test_import_boundaries.py",
+      "tests/test_release.py"
+    ],
+    "note": "Counts deduplicate the repaired failures and focused reruns; fixtures do not establish model/task effectiveness."
+  },
+  "new_model_calls": 0,
+  "new_native_benchmark_rollouts": 0,
+  "remaining_large_modules": [
+    "phase1_codegen/roles/reviewer.py",
+    "phase1_codegen/engine.py"
+  ],
+  "wheel": {
+    "version": "0.2.0",
+    "contains_tests": false,
+    "new_role_and_report_modules_present": true
+  },
+  "cli_help_checked": [
+    "math_apps_online",
+    "phase1_codegen",
+    "phase1_codegen.reporting.campaign"
+  ]
+}

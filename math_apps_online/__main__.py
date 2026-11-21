@@ -11,9 +11,9 @@ def run(args, tasks):
     from phase1_codegen.engine import code_binding
     from phase1_codegen.local_service import verify_local_service, verify_model
     from phase1_codegen.program import Program
-    from phase1_codegen.proposer import PARAMETERS as EVOLVER_PARAMETERS
+    from phase1_codegen.roles.evolver import PARAMETERS as EVOLVER_PARAMETERS
     from phase1_codegen.protocol import HOOK_VERSION
-    from phase1_codegen.review import PARAMETERS as REVIEW_PARAMETERS
+    from phase1_codegen.roles.reviewer import PARAMETERS as REVIEW_PARAMETERS
     from phase1_codegen.tokenization import Tokenizer
     from .decision import OnlineReviewer, ONLINE_REVIEW_PROMPT
     from .native import OnlineEvaluator, actor, adapter_for, verified_inputs

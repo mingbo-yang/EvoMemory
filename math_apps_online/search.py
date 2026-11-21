@@ -14,7 +14,7 @@ from phase1_codegen.memory import CodeMemory
 from phase1_codegen.outcomes import reported_score
 from phase1_codegen.policy import Rejected
 from phase1_codegen.program import WorkerStartupError
-from phase1_codegen.proposer import CodeEvolver, EVOLVER_PROMPT
+from phase1_codegen.roles.evolver import CodeEvolver, EVOLVER_PROMPT
 from .online import registered_test_item
 
 

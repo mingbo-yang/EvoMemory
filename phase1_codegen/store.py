@@ -137,7 +137,7 @@ class RunStore:
 
     def validated_reviews(self, binding, trial):
         """One receipt verifier for adoption and experimental evidence extraction."""
-        from .review import validate_report
+        from phase1_codegen.roles.reviewer import validate_report
         verified = {}
         if trial.get('review_error'):
             raise RuntimeError('Cannot deploy a trial with a failed mechanism review')
@@ -186,7 +186,7 @@ class RunStore:
             return None
         if binding.get('review_contract') != 2 or binding.get('review_required') is not True:
             raise RuntimeError('Experimental adoption requires the grounded fixed Reviewer')
-        from .review import _computed_current_facts
+        from phase1_codegen.roles.reviewer import _computed_current_facts
         shown, original = self.validated_reviews(binding, trial)['post_review']
         rows = [row['data'] for row in shown['evidence'] if row['id'] == 'current:facts']
         facts = _computed_current_facts(original)

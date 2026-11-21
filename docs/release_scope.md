@@ -1,5 +1,11 @@
 # Release scope and validation
 
+The original export described below is version 0.1.0, commit `e08a443`.
+Version 0.2.0 reorganizes role/report modules and moves tests out of runtime
+packages. See [architecture](architecture.md) and
+[`layout_refactor.json`](../provenance/layout_refactor.json) for current paths
+and structural validation. Original export receipts remain historical records.
+
 This repository was exported from the current `evolution_memory_phase1_dev_20261107`
 development checkout, including the November 20, 2026 changes. The original
 checkout, model weights, benchmark assets, and historical experiment results

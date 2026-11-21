@@ -23,8 +23,8 @@ from .experience import EvolutionMemory
 from .local_service import verify_local_service, verify_model
 from .protocol import WORKFLOW_VERSION, HOOK_VERSION
 from .program import BASELINE_SOURCE, Program
-from .proposer import CodeEvolver, EVOLVER_PROMPT, PARAMETERS as EVOLVER_PARAMETERS
-from .review import MechanismReviewer, REVIEW_PROMPT, PARAMETERS as REVIEW_PARAMETERS
+from phase1_codegen.roles.evolver import CodeEvolver, EVOLVER_PROMPT, PARAMETERS as EVOLVER_PARAMETERS
+from phase1_codegen.roles.reviewer import MechanismReviewer, REVIEW_PROMPT, PARAMETERS as REVIEW_PARAMETERS
 from .store import RunStore
 from .capabilities import LocalModelCapabilities
 
