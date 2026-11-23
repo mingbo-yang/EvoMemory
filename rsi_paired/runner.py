@@ -75,6 +75,10 @@ def open_stage(root, cfg, manifest, tasks, exercise_pair=False, *, learning_arch
         row = next(row for row in models.json()["data"] if row["id"] == cfg["model_name"])
         if type(row.get("max_model_len")) is not int or row["max_model_len"] < cfg["context_tokens"]:
             raise ValueError("Registered model context does not fit the advertised service")
+        # vLLM regenerates the model card's created timestamp on each request.
+        # Freeze stable advertised identity and capacity so a client can resume.
+        identity.pop("models_response_hash")
+        identity["max_model_len"] = row["max_model_len"]
     model_hash = workflow.digest(checkpoint)
     cfg = dict(cfg, model_fingerprint=model_hash, seed=manifest["seed"])
     tokenizer = Tokenizer(cfg["tokenizer_path"])
