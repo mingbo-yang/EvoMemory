@@ -36,3 +36,32 @@ def test_manifest_is_written_once(tmp_path):
     with pytest.raises(ValueError, match='Frozen registration'):
         panel.save_registration(path, {'seed': 2})
     assert json.loads(path.read_text()) == {'seed': 1}
+
+
+def test_formal_panel_balances_roles_and_excludes_pilot(tmp_path, monkeypatch):
+    from collections import Counter
+    from rsi_paired.campaign import _campaign_tasks
+
+    games, meta = tmp_path / 'formal-games.zip', tmp_path / 'formal-meta.zip'
+    with ZipFile(games, 'w') as archive, ZipFile(meta, 'w') as metadata:
+        for kind in panel.FAMILIES:
+            for split, count in [('train', 24), ('valid_unseen', 19), ('valid_seen', 4)]:
+                for n in range(count):
+                    room = n if split == 'train' else 100 + n
+                    group = f'{kind}-fixture-{room}'
+                    entry = Path('json_2.1.1') / split / group / 'trial' / 'game.tw-pddl'
+                    archive.writestr(str(entry), str(entry))
+                    metadata.writestr(str(entry.with_name('traj_data.json')), json.dumps({'task_type': kind}))
+    monkeypatch.setattr(panel, 'GAME_SHA', file_hash(games))
+    excluded = {'pick_heat_then_place_in_recep-fixture-0'}
+    manifest = panel.formal_manifest(games, meta, 42, excluded)
+    development = _campaign_tasks(manifest)
+    assert len(development) == len(manifest['final']) == 120
+    assert Counter(x['split'] for x in development) == {'train': 120}
+    assert manifest['final_by_official_split'] == {'valid_unseen': 114, 'valid_seen': 6}
+    assert excluded.isdisjoint(t['group_id'] for t in development)
+    assert len({t['game_sha256'] for t in development + manifest['final']}) == 240
+    assert manifest == panel.formal_manifest(games, meta, 42, excluded)
+    manifest['final'][0] = development[0]
+    with pytest.raises(ValueError):
+        _campaign_tasks(manifest)

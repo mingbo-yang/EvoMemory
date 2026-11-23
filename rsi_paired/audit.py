@@ -381,12 +381,16 @@ class Audit:
             return
         self.check(digest(registration["panels"]) == registration["panel_hash"], "Task panel hash mismatch")
         mother = self.load("parent_snapshot.json")
+        starting = self.load("starting_state.json")
+        if starting is not None:
+            self.check(digest(starting) == registration["state_hash"], "Starting state differs from registration")
         self.report["learning_receipts"] = len(list((self.batch/"jobs/learning").glob("*/result.json")))
         if self.real:
             from phase1_codegen.program import BASELINE_SOURCE
-            source = mother["framework"] if mother else BASELINE_SOURCE
+            source = starting["mechanism"] if starting is not None else BASELINE_SOURCE
+            self.check(mother is None or mother["framework"] == source, "Mother uses the wrong starting mechanism")
             source_hash = hashlib.sha256(source.encode()).hexdigest()
-            bank = {}  # The registered native smoke entry starts with empty, family-scoped memory.
+            bank = starting["memory"] if starting is not None else {}
             for i, task in enumerate(registration["panels"]["learning"]):
                 job = f"learning/{i:03d}"
                 outcome = self.outcome(job)
@@ -404,7 +408,10 @@ class Audit:
             return
         self.check(mother["configuration_hash"] == digest(registration), "Mother differs from registration")
         recent = [self.outcome(f"learning/{i:03d}")["value"] for i in range(len(registration["panels"]["learning"]))]
-        self.check(digest([val[1] for val in recent]) == mother["batch_trajectory_hash"]
+        recent_rows = [val[1] for val in recent]
+        earlier = starting["ledger"] if starting is not None else []
+        self.check(digest(recent_rows) == mother["batch_trajectory_hash"]
+                   and (starting is None or digest(earlier + recent_rows) == mother["learning_hash"])
                    and recent[-1][0] == mother["memory"], "Mother differs from the learning receipts")
         old_hash = None
         revision = self.outcome("revision")
@@ -423,6 +430,8 @@ class Audit:
         first = self.load("slots/P1.json")
         if old_hash is None and first:
             old_hash = first["requested_evolver_hash"]
+        if starting is not None and old_hash is not None:
+            self.check(old_hash == digest(starting["evolver"]), "Proposal policy differs from the batch starting state")
         for prefix in "PON":
             packet = self.load("H_pre.json" if prefix == "P" else "H_shared.json")
             for i in (1,2,3):
@@ -465,6 +474,8 @@ class Audit:
                    and digest(state["ledger"]) == mother["learning_hash"]
                    and len(state["ledger"]) == event["learning_cutoff"] == mother["learning_cutoff"]
                    and event["forced_pair"] == registration["force_pair"], "Commit identity/learning cutoff mismatch")
+        if starting is not None:
+            self.check(state["history"][:-1] == starting["history"], "Commit changed prior batch history")
         self.check(event["parent_snapshot_hash"] == digest(mother) and
                    event["public_context_hash"] == digest(self.load("H_shared.json")), "Commit public packet mismatch")
         result = dict(status=event["status"], forced_engineering=event["forced_pair"], primary=keep)

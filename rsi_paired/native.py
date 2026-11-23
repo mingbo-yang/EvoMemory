@@ -114,11 +114,12 @@ def _verify_completed(ep, task, label, seed, actors, before, bank):
 class Native:
     """Each public bank is a mapping from family to a validated, exact-program snapshot."""
 
-    def __init__(self, root, tasks, tokenizer, model_fingerprint, *, base_url, model_name, capabilities=None):
+    def __init__(self, root, tasks, tokenizer, model_fingerprint, *, base_url, model_name, capabilities=None, learning_archive=None):
         self.root = Path(root).resolve()
         self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.tokenizer = tokenizer
         self.capabilities = capabilities
+        self.learning_archive = Path(learning_archive) if learning_archive is not None else self.root / "learning"
         self.engine = NativeEvaluator(self.root, tasks, tokenizer, model_fingerprint,
                                       {'environment': 'alfworld', 'memory_scope': 'family'},
                                       capabilities=capabilities, base_url=base_url, model_name=model_name)
@@ -148,6 +149,8 @@ class Native:
         if not isinstance(episode_hash, str) or not re.fullmatch('[0-9a-f]{64}', episode_hash):
             raise ValueError('Invalid learning episode reference')
         path = self.root / 'learning' / (episode_hash + '.json')
+        if not path.is_file():
+            path = self.learning_archive / (episode_hash + '.json')
         raw = path.read_bytes()
         if hashlib.sha256(raw).hexdigest() != episode_hash:
             raise ValueError('Learning episode digest changed')
