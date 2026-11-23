@@ -57,13 +57,24 @@ def _checked_state(batch_root):
     return receipt["state"]
 
 
+def _confirmation_input(root, manifest):
+    """Use the core panel plus registered meta games that never reached comparison."""
+    stages = [root / f"evolution-{i+1:02d}" for i in range(len(manifest["batches"]))]
+    states = [initial_state()] + [_checked_state(stage) for stage in stages]
+    supplemental = [i for i, stage in enumerate(stages)
+                    if not (stage / "batch/meta_results.json").is_file()]
+    tasks = [*manifest["confirmation"]]
+    for i in supplemental:
+        tasks.extend(manifest["batches"][i]["meta"])
+    save_registration(root / "confirm/panel.json", dict(
+        tasks=tasks, supplemental_batch_indices=supplemental,
+        checkpoint_hashes=[digest(state) for state in states]))
+    return tasks, states
+
+
 def _stage_spec(root, manifest, name):
     if name == "confirm":
-        # Verify every batch in sequence and preserve the earliest checkpoint on a tie.
-        states = [initial_state()] + [
-            _checked_state(root / f"evolution-{i+1:02d}") for i in range(len(manifest["batches"]))]
-        tasks = manifest["confirmation"]
-        return tasks, states
+        return _confirmation_input(root, manifest)
     if name == "final":
         frozen = _read(root / "frozen.json")
         confirmed = _read(root / "confirm/summary.json")
@@ -71,6 +82,9 @@ def _stage_spec(root, manifest, name):
             raise ValueError("Frozen deployment no longer matches confirmation")
         if frozen["test_panel_hash"] != digest(manifest["final"]):
             raise ValueError("Frozen deployment no longer matches final panel")
+        coverage = _read(root / "development_coverage.json")
+        if frozen["development_coverage_hash"] != digest(coverage):
+            raise ValueError("Frozen deployment no longer matches the complete development evidence")
         return manifest["final"], [frozen["checkpoint"]]
     raise ValueError("Unknown panel stage")
 
@@ -163,6 +177,35 @@ def run_stage(root, cfg, manifest, name):
                                                         tasks_hash=digest(tasks)))
 
 
+def _covered_development(root, manifest, confirmation):
+    """Verify instance use before releasing the independent final panel."""
+    covered = set()
+
+    def include(rows):
+        covered.update(row["task_id"] for row in rows)
+
+    for i, batch in enumerate(manifest["batches"]):
+        stage = root / f"evolution-{i+1:02d}" / "batch"
+        for j, _ in enumerate(batch["learning"]):
+            receipt = _read(stage / f"jobs/learning/{j:03d}/result.json")
+            include([receipt["outcome"]["value"][1]])
+        include(_read(stage / "primary_results.json")["parent"]["evaluation"])
+        meta = stage / "meta_results.json"
+        if meta.is_file():
+            include(_read(meta)["parent"]["evaluation"])
+    for result in confirmation["results"]:
+        include(result["episodes"])
+
+    registered = _campaign_tasks(manifest)
+    if covered != {task["id"] for task in registered}:
+        raise ValueError("Native receipts do not cover the registered 120 development instances")
+    coverage = dict(task_ids=sorted(covered), distinct_tasks=len(covered),
+                    families=dict(Counter(task["family"] for task in registered)),
+                    confirmation_hash=digest(confirmation))
+    save_registration(root / "development_coverage.json", coverage)
+    return coverage
+
+
 def run_campaign(root, manifest_path, cfg_path):
     root = Path(root).resolve()
     manifest = _read(Path(manifest_path))
@@ -176,8 +219,10 @@ def run_campaign(root, manifest_path, cfg_path):
         for stage in [f"evolution-{i+1:02d}" for i in range(4)] + ["confirm", "final"]:
             if stage == "final":
                 confirmed = _read(root / "confirm/summary.json")
+                coverage = _covered_development(root, manifest, confirmed)
                 save_registration(root / "frozen.json",
                                   dict(checkpoint=confirmed["selected"], confirmation_hash=digest(confirmed),
+                                       development_coverage_hash=digest(coverage),
                                        test_panel_hash=digest(manifest["final"]), initial_task_memory="empty",
                                        task_memory_updates="online_same_family", evolve_during_test=False))
             print(f"Campaign stage {stage}", flush=True)

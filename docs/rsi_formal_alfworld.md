@@ -3,7 +3,10 @@
 The 240 distinct games cover six native ALFWorld task families. Each family has
 20 development games and 20 final games. Four development batches each use
 12 learning games, six primary search games and six paired search games.
-The remaining 24 development games form the common confirmation panel.
+The remaining 24 development games form the core confirmation panel. If a
+batch never scores the paired comparison, its six reserved games join that
+panel for every checkpoint. The rule depends on whether a comparison ran.
+A pre-freeze receipt verifies that all 120 development games were reached.
 Development draws from the official training split. Final evaluation prefers
 the official unseen validation split and fills any shortage from the seen
 validation split. Development and final game groups are disjoint.
@@ -12,9 +15,10 @@ Each batch inherits the previous mechanism, proposal policy, family-scoped
 Task Memory and evolution history. It uses the natural self-revision trigger.
 Confirmation compares the initial framework and committed frameworks from
 empty, separate Task Memory on identical games and seeds. A tie goes to the
-earlier checkpoint. The four batches plan at most 336 native episodes, and
-confirmation at most 120. Including the 120 final episodes, the campaign
-plans at most 576 episodes before infrastructure retries.
+earlier checkpoint. Each unscored paired comparison can add 30 confirmation
+episodes across the five checkpoints, within the overall maximum of 576
+episodes across development, confirmation and final evaluation, before
+infrastructure retries.
 
 The final run starts with empty Task Memory and uses a frozen mechanism and
 proposal policy. The fixed Executor applies the frozen Hook, which can update
