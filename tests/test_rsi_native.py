@@ -5,10 +5,12 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
+from evomem.common import file_hash
 from phase1_codegen.hooks import HookSession
 from phase1_codegen.program import Program
-from rsi_paired.native import BASELINE_SOURCE, Native, _evidence, _prefix, _wire
+from rsi_paired.native import BASELINE_SOURCE, Native, _archive_episode, _evidence, _prefix, _wire
 
 
 class Tokens:
@@ -29,6 +31,33 @@ class NativeMemoryTests(unittest.TestCase):
         self.native.capabilities = None
         self.native.fingerprint = 'fixture'
         self.native.engine = SimpleNamespace(check_tasks=lambda tasks: None)
+
+    def test_original_order_episode_bytes_survive_scoring_and_resume(self):
+        ep = {'score': 0, 'goal': 'synthetic', 'info': {'z': 'first', 'a': 'second'}}
+        task = {'id': 'fixture', 'family': 'cool'}
+        program = Program(BASELINE_SOURCE)
+        self.native.job = 'synthetic-job'
+        def execute(directory, program, bank, before, task, seed, label):
+            attempt = directory / 'attempt-0'
+            attempt.mkdir()
+            (attempt / 'canonical_episodes.jsonl').write_text(json.dumps(ep, sort_keys=True) + '\n')
+            (attempt / 'actor.jsonl').touch()
+            identity = _archive_episode(attempt, ep, self.native.root / 'learning')
+            self.assertEqual((attempt / 'episode.json').read_bytes(), _wire(ep))
+            self.assertEqual((self.native.root / 'learning' / (identity + '.json')).read_bytes(), _wire(ep))
+            self.assertNotEqual(_wire(ep), _wire(json.loads((attempt / 'canonical_episodes.jsonl').read_text())))
+            return dict(row=dict(episode_hash=identity, status='completed'), attempt=attempt.name,
+                        snapshot=before, canonical_hash=file_hash(attempt / 'canonical_episodes.jsonl'),
+                        actor_hash=file_hash(attempt / 'actor.jsonl'), episode_wire='episode.json')
+        self.native._execute = Mock(side_effect=execute)
+        args = (program, {}, task, 42, 'panel', 'test-panel', 0)
+        first = self.native._episode(*args)
+        self.assertEqual(self.native._episode(*args), first)
+        wire, = (self.native.root / 'episodes').glob('*/attempt-0/episode.json')
+        wire.write_bytes(b'{}')
+        with self.assertRaisesRegex(ValueError, 'receipt contents changed'):
+            self.native._episode(*args)
+        self.assertEqual(self.native._execute.call_count, 1)
 
     def archive_learning(self, family, task_id):
         task = {'id': task_id, 'family': family, 'environment': 'alfworld'}

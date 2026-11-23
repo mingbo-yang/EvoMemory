@@ -5,7 +5,9 @@ import json
 import pytest
 
 from phase1_codegen.program import BASELINE_SOURCE
-from rsi_paired.roles import INITIAL_STRATEGY, Roles, _compact_experiences, policy_instruction
+from rsi_paired.roles import (
+    INITIAL_STRATEGY, MAX_EVIDENCE_REFERENCES, Roles, _compact_experiences, policy_instruction,
+)
 from rsi_paired.workflow import ContractError, digest
 
 
@@ -84,6 +86,30 @@ def test_invalid_citations_and_real_output_contract(tmp_path):
     r.check('def on_event(state, event, context):\n    return state["missing"]')
 
 
+def test_repeated_valid_review_citations_preserve_evidence_and_wire(tmp_path):
+    citations = ['parent.memory', 'parent.source', 'parent.memory']
+    response = {'findings': [{'evidence_ids': citations, 'judgment': 'insufficient_evidence',
+                              'observation': 'The bank is empty.'}]}
+    r, calls = roles(tmp_path, response)
+    review = r.diagnose(BASELINE_SOURCE, {}, [], [])
+    assert review['findings'][0]['evidence_ids'] == ['parent.memory', 'parent.source']
+    schema = calls[0]['response_format']['json_schema']['schema']
+    refs = schema['properties']['findings']['items']['properties']['evidence_ids']
+    assert (refs['minItems'], refs['maxItems']) == (1, MAX_EVIDENCE_REFERENCES)
+    receipt, = (r.root / 'requests').glob('*/response.json')
+    raw = json.loads(receipt.read_text())['choices'][0]['message']['content']
+    assert json.loads(raw) == response
+
+
+@pytest.mark.parametrize('citations', [[], ['parent.source', 'unavailable'], [None],
+                                       ['parent.source'] * (MAX_EVIDENCE_REFERENCES + 1)])
+def test_invalid_bound_review_citations_are_rejected(tmp_path, citations):
+    r, _ = roles(tmp_path, {'findings': [{'evidence_ids': citations, 'judgment': 'supported_defect',
+                                         'observation': 'The finding requires evidence.'}]})
+    with pytest.raises(ContractError, match='displayed IDs'):
+        r.diagnose(BASELINE_SOURCE, {}, [], [])
+
+
 def test_retrieval_shows_no_private_literals(tmp_path):
     r, _ = roles(tmp_path, {})
     mods = [{'slot': 'P1', 'diff_excerpt': ['+    value = "an instance-specific answer"',
@@ -100,7 +126,8 @@ def test_decision_is_fixed_and_must_cite_displayed_evidence(tmp_path):
              'expected_effect': 'A different proposal may be testable.'}
     r, calls = roles(tmp_path, value)
     packet = {'evidence_ids': ['primary.P1']}
-    assert r.decide(INITIAL_STRATEGY, packet) == value
+    value['evidence_ids'] = ['primary.P1', 'primary.P1']
+    assert r.decide(INITIAL_STRATEGY, packet) == {**value, 'evidence_ids': ['primary.P1']}
     assert 'primary.P1' in str(calls[-1]['response_format'])
     value['target_components'] = ['revise']
     r.set_job(tmp_path/'batch'/'jobs'/'decision'/'1'/'private')

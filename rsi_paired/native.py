@@ -4,6 +4,7 @@ from __future__ import annotations
 import fcntl
 import hashlib
 import json
+import os
 import re
 import time
 from pathlib import Path
@@ -15,11 +16,40 @@ from phase1_codegen.native import NativeEvaluator
 from phase1_codegen.outcomes import candidate_hook_failure
 from phase1_codegen.policy import Rejected
 from phase1_codegen.program import BASELINE_SOURCE, Program, WorkerStartupError
+from .workflow import _sync_directory, _write
 
 
 def _wire(episode):
     # Replay preserves the order of visible mappings: candidates can iterate over them.
     return json.dumps(episode, ensure_ascii=False, allow_nan=False, separators=(',', ':')).encode()
+
+
+def _archive_episode(attempt, episode, learning_dir=None):
+    """Publish the exact bytes seen by replay before a completion can reference them."""
+    raw = _wire(episode)
+    episode_hash = hashlib.sha256(raw).hexdigest()
+    path = attempt / 'episode.json'
+    with path.open('xb') as stream:
+        stream.write(raw)
+        stream.flush()
+        os.fsync(stream.fileno())
+    # The canonical JSONL is key-sorted. Keep both the original ordering and
+    # the independent runner/Actor receipts durable before publishing complete.json.
+    for name in ('canonical_episodes.jsonl', 'actor.jsonl'):
+        with (attempt / name).open('rb') as stream:
+            os.fsync(stream.fileno())
+    _sync_directory(attempt)
+    if learning_dir is not None:
+        learning_dir.mkdir(exist_ok=True)
+        archive = learning_dir / (episode_hash + '.json')
+        try:
+            os.link(path, archive)
+        except FileExistsError:
+            if file_hash(archive) != episode_hash:
+                raise ValueError('Conflicting learning episode archive')
+        _sync_directory(learning_dir)
+        _sync_directory(learning_dir.parent)
+    return episode_hash
 
 
 def _prefix(previous, episode_hash):
@@ -194,7 +224,7 @@ class Native:
         family = task['family']
         bank = self._bank(program, memory, family)
         before = bank.export_snapshot()
-        binding = dict(version=1, evaluator=self.fingerprint, source=program.hash,
+        binding = dict(version=2, evaluator=self.fingerprint, source=program.hash,
                        initial=before['snapshot_hash'], task=digest(task), seed=seed,
                        scope=label, panel=panel, index=index, job=self.job)
         directory = self.root / 'episodes' / digest(binding)
@@ -208,14 +238,16 @@ class Native:
                     raise ValueError('Native completion binding or result changed')
                 result = result['result']
                 raw = directory / result['attempt']
-                if (file_hash(raw/'canonical_episodes.jsonl') != result['canonical_hash']
+                if (result['episode_wire'] != 'episode.json'
+                        or file_hash(raw/'episode.json') != result['row']['episode_hash']
+                        or file_hash(raw/'canonical_episodes.jsonl') != result['canonical_hash']
                         or file_hash(raw/'actor.jsonl') != result['actor_hash']):
                     raise ValueError('Native receipt contents changed')
                 if label == 'learning':
                     self._learning_episode(result['row'])
             else:
                 result = self._execute(directory, program, bank, before, task, seed, label)
-                write(complete, dict(binding=binding, result=result, result_hash=digest(result)))
+                _write(complete, dict(binding=binding, result=result, result_hash=digest(result)))
             if result['row']['status'] == 'method_eval_failure':
                 return dict(memory), result['row']
             updated = dict(memory)
@@ -260,14 +292,7 @@ class Native:
         except Exception as exc:
             write(dest/'infrastructure.json', dict(kind=type(exc).__name__, detail=str(exc)))
             raise
-        raw = _wire(ep)
-        ep_hash = hashlib.sha256(raw).hexdigest()
-        if label == 'learning':
-            archive = self.root/'learning'/f'{ep_hash}.json'
-            archive.parent.mkdir(exist_ok=True)
-            temp = dest/'learning.tmp'
-            temp.write_bytes(raw)
-            temp.replace(archive)
+        ep_hash = _archive_episode(dest, ep, self.root/'learning' if label == 'learning' else None)
         if not failure:
             bank.source_log_hash = _prefix(bank.source_log_hash, ep_hash)
         snapshot = bank.export_snapshot()
@@ -283,5 +308,5 @@ class Native:
                 step=rejected['event']['step'], error_type=rejected['error_type'],
                 message=message[:1024], omitted_chars=max(0, len(message)-1024),
                 error_hash=digest(message))
-        return dict(row=row, snapshot=snapshot, attempt=dest.name,
+        return dict(row=row, snapshot=snapshot, attempt=dest.name, episode_wire='episode.json',
                     canonical_hash=file_hash(dest/'canonical_episodes.jsonl'), actor_hash=file_hash(ledger))

@@ -1,6 +1,9 @@
 # Release scope and validation
 
-For the paired policy-search branch, see [RSI engineering validation](rsi_paired.md).
+The paired policy-search development release adds the `rsi_paired` entry point.
+For its protocol, prerequisites, commands and native audit criteria, see the
+[English guide](rsi_paired.md) and [中文运行说明](rsi_quickstart_zh.md).
+The publication checks below refer to earlier exports.
 
 The original export described below is version 0.1.0, commit `e08a443`.
 Version 0.2.0 reorganizes role/report modules and moves tests out of runtime

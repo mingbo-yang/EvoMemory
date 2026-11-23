@@ -32,16 +32,34 @@ Host failures are journaled and can resume within the registered attempt limit.
 
 ## Reproduce a small native run
 
-Use the editable install in the repository README and install the ALFWorld extra.
-Prepare assets explicitly and use a running local OpenAI-compatible model service.
+Use Linux, Python 3.10 or 3.11, Git and libseccomp (Debian/Ubuntu package
+`libseccomp2`). Run from an editable checkout. Make a local Hugging Face
+checkpoint available and use an already running loopback OpenAI-compatible
+service. Its model ID, advertised checkpoint path and integer `max_model_len`
+are checked against the registration (checkpoint root when reported). Its chat endpoint must support JSON Schema
+structured output. Use a writable local filesystem for `TMPDIR`.
 The commands below take six official training games, two each for learning,
 primary evaluation and paired evaluation. The same two task families occur in all
 three panels. Selection excludes game groups and content shared with non-training
 splits. Supply additional local exclusion manifests with repeated `--exclude`
-arguments. The panel stores the task order, environment seeds and archive hashes.
+arguments. Each exclusion file is a JSON array of objects with `group_id` and
+`game_sha256`. The panel stores the task order, environment seeds and archive hashes.
 
 ```bash
-pip install -e '.[alfworld,models,dev]'
+git clone --branch rsi-original-parent-paired-v2 https://github.com/mingbo-yang/EvoMemory.git
+cd EvoMemory
+python3.10 -m venv .venv
+source .venv/bin/activate
+python -m pip install -e '.[alfworld,models,dev]'
+python -m rsi_paired --help
+# Set these to match your running service.
+export EVOMEMORY_BASE_URL=http://127.0.0.1:8141/v1
+export EVOMEMORY_MODEL_NAME=gemma-4-31b-it
+export EVOMEMORY_MODEL_PATH=/absolute/path/to/served/checkpoint
+export EVOMEMORY_ENABLE_OPTIONAL_MODELS=0 TMPDIR=/tmp
+curl --fail --noproxy '*' "${EVOMEMORY_BASE_URL}/models"
+# Example only. Use a positive integer no larger than the advertised max_model_len.
+export MODEL_CONTEXT_TOKENS=262144
 python -m scripts.prepare_assets alfworld
 python -m rsi_paired prepare-smoke \
   --games data/downloads/alfworld-tw-0.4.2.zip \
@@ -81,6 +99,11 @@ separate output directory and pass `--exercise-pair`. The natural trigger
 decision is still recorded. A forced exercise tests plumbing and is excluded
 from evidence of autonomous triggering.
 
+For example, append `--exercise-pair` to the command above and use
+`--out runs/smoke-paired` for that run. Register the checkpoint once and keep
+the previous model config, panel, flags and program version when resuming.
+An interrupted native attempt with an unknown outcome needs reconciliation.
+
 A complete batch with six distinct tasks uses at most 26 planned native episodes,
 nine proposal slots and 36 mechanism submissions, plus separate model calls for
 review, self-revision and optional capabilities. Independent infrastructure
@@ -94,4 +117,15 @@ Re-run the same command to recover eligible unfinished work.
 learning and evaluation receipts and usage. Add `--require-complete` for a
 packaging or CI gate. The report checks original-parent and policy identities,
 the public evidence delivered in proposal requests, panel results and the
-deployment decision against the underlying receipts.
+deployment decision against the underlying receipts. New native attempts store
+the original ordered episode bytes alongside the canonical log. For a completed
+historical run with missing ordered panel evidence, the audit reports
+`unverified_native_wire`; its original scores remain available for inspection.
+
+A successful completion audit can also describe a naturally untriggered batch.
+For evidence of the full comparison, check `status == "verified"`,
+`coverage.paired_sealed == true`, all nine slots (P1–P3, O1–O3, N1–N3)
+and `state.history[-1].status == "paired_complete"` in
+`batch/commit.json`. An in-progress or incompletely witnessed run does not
+establish paired-path coverage. CPU regression tests run with
+`python -m pytest -q`; the small engineering panel measures execution coverage.

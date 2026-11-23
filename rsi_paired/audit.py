@@ -3,7 +3,10 @@ import argparse
 from collections import Counter
 import hashlib
 import json
+import re
 from pathlib import Path
+
+from phase1_codegen.outcomes import candidate_hook_failure
 
 from .workflow import digest
 
@@ -41,6 +44,11 @@ class Audit:
         self.slots = {}
         self.intents = {}
         self.native_rows = {}
+        self.native_origins = set()
+        self.native_verified = set()
+        self.native_missing_wire = []
+        self.ordered_wire_verified = 0
+        self.native_fingerprint = None
         self.report = dict(status="partial", findings=self.errors, slots=self.slots, scores={}, costs={},
                            coverage={}, unresolved_jobs=[], barrier={})
         self.real = (root / "runtime.json").exists()
@@ -83,32 +91,125 @@ class Audit:
                               if k in ("prompt_tokens","input_tokens","completion_tokens","total_tokens") and type(v) is int})
         costs["memory_model"] = dict(receipts=len(caps_rows), physical=sum(bool(r.get("physical")) for r in caps_rows),
                                    cache_hits=sum(bool(r.get("cache_hit")) for r in caps_rows), observed_usage=dict(usage))
+        if self.real:
+            self.native_fingerprint = read(root / "runtime.json").get("native_fingerprint")
         for path in (root/"native/episodes").glob("*/complete.json"):
-            data = read(path)
-            res = data["result"]
-            self.check(digest(res) == data["result_hash"] and digest(data["binding"]) == path.parent.name,
-                       "Native episode completion identity changed")
-            attempt = path.parent / res["attempt"]
-            if Path(res["attempt"]).name != res["attempt"] or not res["attempt"].startswith("attempt-"):
-                raise ValueError("Invalid native attempt reference")
-            row = res["row"]
-            canonical = attempt / "canonical_episodes.jsonl"
-            self.check(file_hash(canonical) == res["canonical_hash"]
-                       and file_hash(attempt / "actor.jsonl") == res["actor_hash"], "Native evidence files changed")
-            episodes = list(lines(canonical))
-            self.check(len(episodes) == 1, "Native attempt must have exactly one episode")
-            ep = episodes[0]
-            valid = (ep["task_id"] == row["task_id"] and ep["phase"] == row["phase"]
-                     and ep["synthetic"] is False and row["native_score"] == ep["score"])
-            if row["status"] == "method_eval_failure":
-                valid &= row["score"] == 0 and bool(ep["error"])
-            else:
-                valid &= (not ep["error"] and ep["native_reward_verified"] is True
-                          and row["score"] == ep["native_recorder"]["reward"] == ep["score"])
-            self.check(valid, "A completed native task does not reproduce its reported outcome")
-            self.native_rows.setdefault(row["episode_hash"], set()).add(digest(row))
-        costs["completed_native_episodes"] = sum(1 for _ in (root/"native/episodes").glob("*/complete.json"))
+            self._index_native(path)
+        self.check(len(self.native_origins) <= 1, "Native jobs come from different original run directories")
+        costs["completed_native_episodes"] = len(self.native_rows)
         costs["native_attempt_directories"] = sum(1 for _ in (root/"native/episodes").glob("*/attempt-*"))
+        self.report["native_wire"] = dict(verified=self.ordered_wire_verified,
+                                          unavailable_legacy_panels=sorted(self.native_missing_wire))
+
+    def _index_native(self, path):
+        data = read(path)
+        binding, result = data["binding"], data["result"]
+        self.check(digest(result) == data["result_hash"] and digest(binding) == path.parent.name,
+                   "Native episode completion identity changed")
+        if not re.fullmatch(r"attempt-[0-9]+", result["attempt"]):
+            raise ValueError("Invalid native attempt reference")
+        attempt = path.parent / result["attempt"]
+        canonical = attempt / "canonical_episodes.jsonl"
+        self.check(file_hash(canonical) == result["canonical_hash"]
+                   and file_hash(attempt / "actor.jsonl") == result["actor_hash"], "Native evidence files changed")
+        # A partial second line is also inconsistent with a sealed, single-episode file.
+        ep = json.loads(canonical.read_bytes())
+        row, snapshot = result["row"], result["snapshot"]
+        episode_hash = row["episode_hash"]
+        if not isinstance(episode_hash, str) or not re.fullmatch("[a-f0-9]{64}", episode_hash):
+            raise ValueError("Invalid native episode hash")
+        version = binding["version"]
+        self.check(type(version) is int and version in (1, 2), "Unknown native binding version")
+        exact = attempt / "episode.json"
+        if version == 2 or "episode_wire" in result:
+            self.check(result.get("episode_wire") == exact.name and exact.is_file(),
+                       "Missing or invalid native ordered episode witness")
+        learning = binding["scope"] == "learning"
+        archive = self.root / "native/learning" / (episode_hash + ".json")
+        if learning:
+            self.check(archive.is_file() and file_hash(archive) == episode_hash, "Native learning archive changed")
+        witness = exact if exact.is_file() else archive if learning and archive.is_file() else None
+        exact_bytes = witness.read_bytes() if witness else None
+        ordered = json.loads(exact_bytes) if witness else ep
+        # Program execution observes mapping insertion order. Historical canonical JSONL sorted its keys.
+        wire = json.dumps(ordered, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode()
+        valid_wire = hashlib.sha256(wire).hexdigest() == episode_hash
+        if version == 1 and not witness and not learning and not valid_wire:
+            self.native_missing_wire.append(path.parent.name)
+        else:
+            if self.check(valid_wire and digest(ordered) == digest(ep) and
+                          (witness is None or wire == exact_bytes), "Native ordered episode digest/content changed"):
+                self.ordered_wire_verified += 1
+        valid = (ep["task_id"] == row["task_id"] and ep["phase"] == row["phase"] == binding["scope"]
+                 and ep["environment"] == row["environment"] == "alfworld" and ep["family"] == row["family"]
+                 and ep["seed"] == binding["seed"] and ep["program_hash"] == binding["source"]
+                 and ep["synthetic"] is False and row["native_score"] == ep["score"]
+                 and ep.get("error") == row.get("error"))
+        valid &= type(row["score"]) in (int, float) and row["score"] in (0, 1)
+        if row["status"] == "method_eval_failure":
+            valid &= (not learning and row["score"] == 0 and ep["score"] is None
+                      and candidate_hook_failure(ep, binding["source"]))
+        else:
+            recorder = ep["native_recorder"]
+            reward = recorder["steps"][-1]["scores"] if recorder["steps"] else 0
+            valid &= (row["status"] == "completed" and not ep["error"] and ep["native_reward_verified"] is True
+                      and row["score"] == reward == recorder["reward"] == ep["score"])
+        self.check(valid, "A completed native task does not reproduce its reported outcome")
+        self.check(snapshot["snapshot_hash"] == digest({k:v for k,v in snapshot.items() if k != "snapshot_hash"})
+                   and snapshot["program_hash"] == binding["source"]
+                   and snapshot["memory_hash"] == ep["memory_hash_after"]
+                   and snapshot["memory_hash"] == self._memory_hash(snapshot), "Native result snapshot changed")
+        # Native stores an absolute job path. Preserve identity after copying a complete run elsewhere.
+        job_path = Path(binding["job"])
+        parts = job_path.parts
+        if not (job_path.is_absolute() and len(parts) >= 6 and parts[-5:-3] == ("batch", "jobs")
+                and parts[-1] == "private" and parts[-3] in ("learning", "evaluation")):
+            raise ValueError("Unexpected native job path")
+        self.native_origins.add(job_path.parents[4])
+        key = ("/".join(parts[-3:-1]), binding["index"])
+        self.check(key not in self.native_rows, f"Duplicate native receipt for {key}")
+        self.native_rows[key] = (binding, row, snapshot, ep["environment_seed"], ep["memory_hash_before"])
+
+    @staticmethod
+    def _memory_hash(snapshot):
+        return digest({k:snapshot[k] for k in ("program_hash", "state_wire", "context_wire",
+                                                "capacity", "read_budget", "top_k")})
+
+    def bind_native(self, job, index, task, seed, source_hash, panel, bank, row=None):
+        key = (job, index)
+        if key not in self.native_rows:
+            self.check(row is None, f"Missing native receipt for {job}/{index}")
+            return bank
+        self.native_verified.add(key)
+        binding, actual, after, env_seed, before_hash = self.native_rows[key]
+        family = task["family"]
+        before = bank.get(family)
+        if before is None:
+            # For the family's first task, reconstruct CodeMemory's empty snapshot from its fixed context.
+            before = dict(after, state_wire="{}", family=None, families=[], source_log_hash=digest([]),
+                          stored_tokens=actual["evidence"]["stored_tokens_before"])
+            before["memory_hash"] = self._memory_hash(before)
+            before["snapshot_hash"] = digest({k:v for k,v in before.items() if k != "snapshot_hash"})
+        expected = dict(evaluator=self.native_fingerprint, source=source_hash, initial=before["snapshot_hash"],
+                        task=digest(task), seed=seed, scope="learning" if panel is None else "panel",
+                        panel=panel, index=index)
+        self.check(all(binding.get(k) == v for k,v in expected.items())
+                   and actual["task_id"] == task["id"] and actual["family"] == family and env_seed == task["seed"]
+                   and before_hash == before["memory_hash"] and json.loads(after["context_wire"])["family"] == family
+                   and (row is None or digest(actual) == digest(row)), f"Native task binding mismatch for {job}/{index}")
+        if actual["status"] == "method_eval_failure":
+            self.check(after == before, f"Failed native candidate changed memory for {job}/{index}")
+            return bank
+        self.check(after["family"] == family and after["source_log_hash"] ==
+                   digest([before["source_log_hash"], actual["episode_hash"]]), f"Native memory chain mismatch for {job}/{index}")
+        return {**bank, family:after}
+
+    def bind_panel(self, key, tasks, seeds, source, bank, outcomes):
+        source_hash = hashlib.sha256(source.encode()).hexdigest()  # Program.hash hashes the original UTF-8 source.
+        panel = digest(dict(tasks=tasks, seeds=seeds, pre=bank, program=source_hash, evaluator=self.native_fingerprint))
+        for index, (task, seed) in enumerate(zip(tasks, seeds)):
+            row = outcomes[index] if outcomes is not None else None
+            bank = self.bind_native("evaluation/"+key, index, task, seed, source_hash, panel, bank, row)
 
     def _slot_wire(self, label, index, expected, packet, original, previous, error):
         scope = f"batch/jobs/proposals/{label}/{index}/private"
@@ -197,40 +298,63 @@ class Audit:
                 source = mother["framework"]
                 expected["parent"] = digest(dict(valid=True, source=source, source_hash=digest(source)))
             self.check(seal == expected, f"{phase} seal differs from immutable slots")
-        if records is None:
+        if records is None and (seal is None or not self.real):
             return None
-        self.check(seal is not None, f"{phase} scores without all proposals sealed")
         commons = ["parent"] if phase == "primary" else ["retained","parent"]
-        self.check(set(records) == set(commons+names), f"Unexpected {phase} membership")
+        if records is not None:
+            self.check(seal is not None, f"{phase} scores without all proposals sealed")
+            self.check(set(records) == set(commons+names), f"Unexpected {phase} membership")
         tasks = registered["panels"][phase]
         seeds = [int(digest([registered["seed"],"native",t["id"]])[:8], 16) % 2147483647 for t in tasks]
         scores, evals = {}, {}
         for n in commons+names:
-            row = records[n]
             source = (mother["framework"] if n=="parent" else primary[0][primary[1]]["source"] if n=="retained"
                       else self.load("slots/"+n+".json")["source"])
-            self.check(row["source"] == source, f"Scored a different program: {phase}/{n}")
-            if not row["valid"]:
+            row = records[n] if records is not None else None
+            if row is not None:
+                self.check(row["source"] == source, f"Scored a different program: {phase}/{n}")
+            if row is not None and not row["valid"]:
                 self.check(row["success_count"] is None and "evaluation" not in row,
                            f"Invalid candidate has a native score: {phase}/{n}")
                 scores[n] = None
                 continue
-            bank = mother["memory"] if source == mother["framework"] else self.outcome("preparation/"+digest(source))["value"]
+            if source is None:
+                continue
+            if source == mother["framework"]:
+                bank = mother["memory"]
+            else:
+                prepared = self.outcome("preparation/"+digest(source))
+                if not prepared or not prepared["ok"]:
+                    self.check(row is None, f"Missing prepared memory: {phase}/{n}")
+                    continue
+                bank = prepared["value"]
             key = digest([registered["protocol"], registered["adapter_fingerprint"], digest(source),
                           digest(bank), phase, tasks, seeds, "private-online-memory"])
+            job_name = "evaluation/"+key
+            job = self.outcome(job_name)
+            if job and self.real:
+                self.check(self.load("jobs/"+job_name+"/result.json")["request_hash"] == digest(key),
+                           f"Evaluation job request mismatch: {phase}/{n}")
+            if row is None:
+                # Evaluation jobs are durable before the aggregate results file is sealed.
+                outcomes = job["value"] if job and job["ok"] else None
+                if outcomes is not None:
+                    self.check(len(outcomes) == len(tasks), f"Incomplete native job: {phase}/{n}")
+                self.bind_panel(key, tasks, seeds, source, bank, outcomes)
+                continue
             self.check(key == row["eval_key"] and digest(bank) == row["pre_memory_hash"],
                        f"Wrong private pre-evaluation memory or gate: {phase}/{n}")
-            job = self.outcome("evaluation/"+key)
             self.check(job and job["ok"] and row["evaluation"] == job["value"], f"Unbound score receipt {phase}/{n}")
             outcomes = row["evaluation"]
             self.check([r["task_id"] for r in outcomes] == [t["id"] for t in tasks]
                        and all(type(r["score"]) in (int,float) and r["score"] in (0,1) for r in outcomes)
                        and sum(r["score"] for r in outcomes) == row["success_count"], f"Incomplete scores {phase}/{n}")
             if self.real:
-                self.check(all(digest(r) in self.native_rows.get(r.get("episode_hash"), set()) for r in outcomes),
-                           f"Unbound native score {phase}/{n}")
+                self.bind_panel(key, tasks, seeds, source, bank, outcomes)
             scores[n] = row["success_count"]
             evals[n] = key
+        if records is None:
+            return None
         # The signed content relationship is verifiable after copying. The order check
         # below additionally uses original filesystem mtimes, which some copies discard.
         path = self.batch / ("primary_seal.json" if phase == "primary" else "paired_seal.json")
@@ -258,6 +382,23 @@ class Audit:
         self.check(digest(registration["panels"]) == registration["panel_hash"], "Task panel hash mismatch")
         mother = self.load("parent_snapshot.json")
         self.report["learning_receipts"] = len(list((self.batch/"jobs/learning").glob("*/result.json")))
+        if self.real:
+            from phase1_codegen.program import BASELINE_SOURCE
+            source = mother["framework"] if mother else BASELINE_SOURCE
+            source_hash = hashlib.sha256(source.encode()).hexdigest()
+            bank = {}  # The registered native smoke entry starts with empty, family-scoped memory.
+            for i, task in enumerate(registration["panels"]["learning"]):
+                job = f"learning/{i:03d}"
+                outcome = self.outcome(job)
+                seed = int(digest([registration["seed"], "native", task["id"]])[:8], 16) % 2147483647
+                row = outcome["value"][1] if outcome and outcome["ok"] else None
+                updated = self.bind_native(job, 0, task, seed, source_hash, None, bank, row)
+                if row is not None:
+                    self.check(outcome["value"][0] == updated, f"Learning job returned a different memory: {job}")
+                    receipt = self.load("jobs/"+job+"/result.json")
+                    self.check(receipt["request_hash"] == digest([digest(source), digest(bank), task, seed]),
+                               f"Learning job request mismatch: {job}")
+                bank = updated
         if not mother:
             self.report["stage"] = "collecting_learning_episodes"
             return
@@ -265,9 +406,6 @@ class Audit:
         recent = [self.outcome(f"learning/{i:03d}")["value"] for i in range(len(registration["panels"]["learning"]))]
         self.check(digest([val[1] for val in recent]) == mother["batch_trajectory_hash"]
                    and recent[-1][0] == mother["memory"], "Mother differs from the learning receipts")
-        if self.real:
-            self.check(all(digest(val[1]) in self.native_rows.get(val[1].get("episode_hash"),set())
-                           for val in recent), "Missing native learning receipt")
         old_hash = None
         revision = self.outcome("revision")
         new_hash = digest(revision["value"]) if revision and revision["ok"] else None
@@ -369,6 +507,10 @@ def audit_run(run_dir):
         audit.inspect()
     except (OSError, ValueError, KeyError, IndexError, TypeError) as exc:
         audit.errors.append(f"Unreadable or inconsistent receipt: {type(exc).__name__}: {exc}")
+    if audit.real and audit.report["status"] in ("verified", "verified_fallback"):
+        audit.check(set(audit.native_rows) == audit.native_verified, "Native completions outside registered jobs")
+        if audit.native_missing_wire:
+            audit.report["status"] = "unverified_native_wire"
     if audit.errors:
         audit.report["status"] = "audit_failed"
     return audit.report

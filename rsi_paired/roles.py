@@ -70,6 +70,7 @@ def on_event(state, event, context):
 ROLE_SETTINGS = {'propose': (.7, 6144), 'revise': (.7, 6144),
                  'decide': (0, 1024), 'review': (0, 3072), 'diagnose': (0, 3072)}
 MAX_POLICY_TEXT_BYTES = 4096
+MAX_EVIDENCE_REFERENCES = 32
 
 
 def _text(value, *, empty=False):
@@ -199,22 +200,28 @@ def _compact_experiences(events, tokens):
 
 
 def _evidence_ids(ids, available):
-    return (isinstance(ids, list) and 0 < len(ids) <= 32
-            and all(isinstance(i, str) and i in available for i in ids)
-            and len(ids) == len(set(ids)))
+    if (not isinstance(ids, list) or not 1 <= len(ids) <= MAX_EVIDENCE_REFERENCES
+            or any(not isinstance(i, str) or i not in available for i in ids)):
+        raise ContractError('Evidence references must be a nonempty bounded list of displayed IDs')
+    # Repeating a citation adds no evidence. Keep first-citation order in the
+    # downstream record while the model's original response remains on disk.
+    return list(dict.fromkeys(ids))
 
 
 def _format(role, user):
     def obj(fields):
         return dict(type='object', properties=fields, required=list(fields), additionalProperties=False)
+    def citations(available):
+        return dict(type='array', minItems=1, maxItems=MAX_EVIDENCE_REFERENCES,
+                    items=dict(type='string', enum=list(available)))
     string = dict(type='string')
     if role in {'diagnose', 'review'}:
-        ids = dict(type='array', minItems=1, items=dict(type='string', enum=list(user['evidence'])))
+        ids = citations(user['evidence'])
         finding = obj(dict(evidence_ids=ids, judgment=dict(type='string', enum=sorted(FINDING_KINDS)),
                            observation=string))
         schema = obj(dict(findings=dict(type='array', minItems=1, maxItems=8, items=finding)))
     elif role == 'decide':
-        ids = dict(type='array', minItems=1, items=dict(type='string', enum=user['public_evidence']['evidence_ids']))
+        ids = citations(user['public_evidence']['evidence_ids'])
         schema = obj(dict(should_update=dict(type='boolean'), reason=string, evidence_ids=ids,
                           target_components=dict(type='array', maxItems=1, items=dict(type='string', enum=['propose'])),
                           expected_effect=string))
@@ -326,12 +333,13 @@ class Roles:
         findings = response.get('findings')
         if not isinstance(findings, list) or not 1 <= len(findings) <= 8:
             raise ContractError('Reviewer must return one to eight findings')
+        reviewed = []
         for finding in findings:
             if (not isinstance(finding, dict) or set(finding) != {'evidence_ids', 'judgment', 'observation'}
-                    or finding['judgment'] not in FINDING_KINDS or not _text(finding['observation'])
-                    or not _evidence_ids(finding['evidence_ids'], evidence)):
+                    or finding['judgment'] not in FINDING_KINDS or not _text(finding['observation'])):
                 raise ContractError('Reviewer finding lacks a bound judgment, observation or evidence citation')
-        return dict(findings=findings, evidence_hash=digest(evidence))
+            reviewed.append({**finding, 'evidence_ids': _evidence_ids(finding['evidence_ids'], evidence)})
+        return dict(findings=reviewed, evidence_hash=digest(evidence))
 
     def diagnose(self, mechanism, memory, ledger, history):
         evidence = {'parent.source': mechanism, 'parent.memory': {
@@ -419,10 +427,9 @@ class Roles:
         if (set(result) != {'should_update', 'reason', 'evidence_ids', 'target_components', 'expected_effect'}
                 or type(result['should_update']) is not bool or not _text(result['reason'])
                 or not _text(result['expected_effect'])
-                or result['target_components'] != (['propose'] if result['should_update'] else [])
-                or not _evidence_ids(result['evidence_ids'], packet.get('evidence_ids', []))):
+                or result['target_components'] != (['propose'] if result['should_update'] else [])):
             raise ContractError('Invalid self-revision decision or unavailable evidence reference')
-        return result
+        return {**result, 'evidence_ids': _evidence_ids(result['evidence_ids'], packet.get('evidence_ids', []))}
 
     def revise(self, evolver, packet):
         _program(evolver)

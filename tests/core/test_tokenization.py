@@ -1,6 +1,6 @@
 """CPU-only counting contracts and comparison with archived real server usage."""
 import json
-from pathlib import Path
+from importlib.util import find_spec
 import types
 import unittest
 
@@ -12,14 +12,23 @@ from phase1_codegen.tokenization import Tokenizer, _single_sequence_length
 
 
 class TokenSequenceTests(unittest.TestCase):
-    def test_mapping_list_and_cpu_tensor_count_tokens_not_fields(self):
-        from transformers import BatchEncoding
-        import torch
+    def test_mapping_list_and_numpy_count_tokens_not_fields(self):
         for value in ([7, 8, 9], [[7, 8, 9]],
                       {'input_ids': [7, 8, 9], 'attention_mask': [1, 1, 1]},
-                      BatchEncoding({'input_ids': [7, 8, 9], 'attention_mask': [1, 1, 1]}),
-                      np.array([7, 8, 9]), np.array([[7, 8, 9]]),
-                      torch.tensor([7, 8, 9], device='cpu'),
+                      np.array([7, 8, 9]), np.array([[7, 8, 9]])):
+            with self.subTest(type=type(value)):
+                self.assertEqual(_single_sequence_length(value), 3)
+
+    @unittest.skipUnless(find_spec('transformers'), 'Optional transformers dependency required')
+    def test_transformers_batch_encoding_counts_tokens_not_fields(self):
+        from transformers import BatchEncoding
+        value = BatchEncoding({'input_ids': [7, 8, 9], 'attention_mask': [1, 1, 1]})
+        self.assertEqual(_single_sequence_length(value), 3)
+
+    @unittest.skipUnless(find_spec('torch'), 'Optional torch dependency required')
+    def test_cpu_tensor_counts_tokens_not_fields(self):
+        import torch
+        for value in (torch.tensor([7, 8, 9], device='cpu'),
                       {'input_ids': torch.tensor([[7, 8, 9]], device='cpu')}):
             with self.subTest(type=type(value)):
                 self.assertEqual(_single_sequence_length(value), 3)
@@ -50,6 +59,7 @@ class TokenSequenceTests(unittest.TestCase):
 
 
 @unittest.skipUnless((MODEL/'config.json').is_file(), 'Separately installed real tokenizer checkpoint required')
+@unittest.skipUnless(find_spec('transformers'), 'Optional transformers dependency required')
 class RealLocalTokenizerTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
