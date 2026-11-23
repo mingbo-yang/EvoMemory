@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "evomemory-research"
-version = "0.2.0"
+version = "0.3.0.dev1"
 description = "Code evolution of agent memory mechanisms with structured evolution experience"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -24,6 +24,7 @@ dev = ["pytest>=8,<10", "build>=1.2", "twine>=5", "Pillow>=10"]
 
 [project.scripts]
 evomemory = "math_apps_online.__main__:main"
+evomemory-rsi = "rsi_paired.__main__:main"
 evomemory-campaign = "phase1_codegen.campaign:main"
 
 [project.urls]
@@ -32,7 +33,7 @@ Issues = "https://github.com/mingbo-yang/EvoMemory/issues"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["evomem*", "phase1_codegen*", "math_apps_online*", "benchmarks*", "scripts*"]
+include = ["evomem*", "rsi_paired*", "phase1_codegen*", "math_apps_online*", "benchmarks*", "scripts*"]
 exclude = ["tests*"]
 
 [tool.setuptools.package-data]
@@ -40,6 +41,11 @@ exclude = ["tests*"]
 
 [tool.pytest.ini_options]
 testpaths = [
+  "tests/test_rsi_panel.py",
+  "tests/test_rsi_audit.py",
+  "tests/test_rsi_workflow.py",
+  "tests/test_rsi_roles.py",
+  "tests/test_rsi_native.py",
   "tests/test_release.py",
   "tests/test_import_boundaries.py",
   "tests/core/test_local_service.py",
