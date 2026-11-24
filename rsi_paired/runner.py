@@ -15,7 +15,7 @@ from . import roles as roles_module
 from . import workflow
 from . import witness
 from .native import BASELINE_SOURCE, Native
-from .panel import save_registration
+from .panel import SEQUENTIAL_PROTOCOL, save_registration
 from .roles import INITIAL_STRATEGY, Roles
 
 
@@ -44,7 +44,7 @@ class SmokeAdapter(Roles):
 
 
 def run_smoke(root, cfg, manifest, exercise_pair=False):
-    if manifest.get("scope") != "engineering" or manifest.get("protocol") != "rsi_original_parent_paired_v2":
+    if manifest.get("scope") != "engineering" or manifest.get("protocol") not in (workflow.PROTOCOL, SEQUENTIAL_PROTOCOL):
         raise ValueError("Expected a registered engineering panel")
     panels = manifest["panels"]
     if set(panels) != {"learning", "primary", "meta"} or any(len(rows) != 2 for rows in panels.values()):
@@ -54,7 +54,7 @@ def run_smoke(root, cfg, manifest, exercise_pair=False):
     all_tasks = [task for tasks in panels.values() for task in tasks]
     with open_stage(root, cfg, manifest, all_tasks, exercise_pair) as adapter:
         state = initial_state()
-        return workflow.run_batch(root / "batch", state=state, panels=panels, adapter=adapter,
+        return workflow.run_batch(root / "batch", state=state, panels=panels, adapter=adapter, protocol=manifest["protocol"],
                                   seed=manifest["seed"], force_pair=exercise_pair,
                                   budget={"episodes": 26, "infrastructure_attempts": 2})
 
@@ -64,7 +64,7 @@ def initial_state():
 
 
 @contextmanager
-def open_stage(root, cfg, manifest, tasks, exercise_pair=False, *, learning_archive=None):
+def open_stage(root, cfg, manifest, tasks, exercise_pair=False, *, learning_archive=None, shared_evolution_memory=()):
     from scripts.alma_feasibility import LEGACY, META
     if (file_hash(LEGACY / "downloads/alfworld-tw-0.4.2.zip") != manifest["games_sha256"]
             or file_hash(META) != manifest["metadata_sha256"]):
@@ -95,6 +95,8 @@ def open_stage(root, cfg, manifest, tasks, exercise_pair=False, *, learning_arch
                         }.items()}, forced_engineering=exercise_pair,
                         model_config_hash=workflow.digest(cfg), role_limits=roles_module.ROLE_SETTINGS,
                         optional_models=os.environ.get("EVOMEMORY_ENABLE_OPTIONAL_MODELS", "1"))
+    if shared_evolution_memory:
+        dependencies["shared_evolution_memory_hash"] = workflow.digest(shared_evolution_memory)
     # Store a JSON-normalized value so tuple-valued sampling settings compare on recovery.
     import json
     with ExitStack() as resources:
@@ -103,10 +105,12 @@ def open_stage(root, cfg, manifest, tasks, exercise_pair=False, *, learning_arch
         resources.callback(caps.close)
         cfg["model_catalog"] = caps.describe()
         native = Native(root / 'native', tasks, tokenizer, model_hash, base_url=cfg["base_url"],
-                        model_name=cfg["model_name"], capabilities=caps, learning_archive=learning_archive)
+                        model_name=cfg["model_name"], capabilities=caps, learning_archive=learning_archive,
+                        protocol=manifest["protocol"])
         resources.callback(native.close)
         dependencies.update(capability_fingerprint=caps.fingerprint, native_fingerprint=native.fingerprint)
         save_registration(root / "runtime.json", json.loads(workflow.canonical(dependencies)))
         adapter = SmokeAdapter(root, cfg, tokenizer, native, workflow.digest(dependencies))
+        adapter.shared_evolution_memory = tuple(shared_evolution_memory)
         resources.callback(adapter.close)
         yield adapter

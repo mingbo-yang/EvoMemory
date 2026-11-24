@@ -89,21 +89,26 @@ def _stage_spec(root, manifest, name):
     raise ValueError("Unknown panel stage")
 
 
-def _native_panel(root, adapter, states, tasks, seed):
+def _native_panel(root, adapter, states, tasks, seed, *, arms=None):
+    if arms is not None and (len(arms) != len(states) or len(set(arms)) != len(states)):
+        raise ValueError("Each independently executed frozen arm needs a distinct name")
     journal = _Journal(root / "batch", adapter, 2)
     seeds = [_seed(seed, "native", t["id"]) for t in tasks]
     programs = {}
     results = []
     for index, state in enumerate(states):
         source, policy = state["mechanism"], state["evolver"]
-        key = digest([adapter.fingerprint, source, tasks, seeds, "empty-family-memory"])
+        binding = [adapter.fingerprint, source, tasks, seeds, "empty-family-memory"]
+        if arms is not None:
+            binding.append(arms[index])
+        key = digest(binding)
         if key not in programs:
             def evaluate():
                 rows = adapter.evaluate(source, {}, tasks, seeds)
                 if len(rows) != len(tasks):
                     raise ValueError("Incomplete frozen panel")
                 for row, task in zip(rows, tasks):
-                    _validate_score(row, task)
+                    _validate_score(row, task, classified=arms is not None)
                 return rows
 
             programs[key] = journal.job("evaluation/" + key, key, evaluate)
@@ -120,6 +125,10 @@ def _native_panel(root, adapter, states, tasks, seed):
                             evaluation_key=key, counts={k: dict(v) for k, v in categories.items()},
                             episodes=[dict(task_id=r["task_id"], score=r["score"], native_score=r["native_score"],
                                            status=r["status"], episode_hash=r["episode_hash"]) for r in rows]))
+        if arms is not None:
+            results[-1]["arm"] = arms[index]
+            for episode, row in zip(results[-1]["episodes"], rows):
+                episode["recorded_steps"] = row["evidence"]["steps"]
 
     audit = Audit(root)
     audit.costs_and_wire()

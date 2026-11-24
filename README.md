@@ -12,13 +12,12 @@ from earlier edits for subsequent proposals.
 | ALMA campaign | `python -m phase1_codegen` | The Task Memory program across a registered campaign |
 | [Paired proposal-policy search](docs/rsi_paired.md) | `python -m rsi_paired` | The Task Memory program and the Evolver's proposal policy |
 
-For the paired-search development version, check out `rsi-original-parent-paired-v2`
-and run `python -m rsi_paired`. Both proposal policies generate fresh mechanisms
+From this paired-search checkout, run `python -m rsi_paired`. Both proposal policies generate fresh mechanisms
 from the same starting program, learning state and external evidence.
 See the [English run guide](docs/rsi_paired.md) or the
 [中文运行说明](docs/rsi_quickstart_zh.md) for the six-task native smoke test.
-The [formal ALFWorld guide](docs/rsi_formal_alfworld.md) covers the 240-task
-campaign, checkpoint recovery and frozen evaluation.
+The [formal ALFWorld guide](docs/rsi_formal_alfworld.md) describes six rounds per task
+family, the sequential transfer of Evolution Memory and the paired 100-game final tests.
 
 ## Task Memory evolution
 
@@ -55,7 +54,7 @@ Use **Linux and Python 3.10 or 3.11**. The isolation layer requires `libseccomp`
 there is no unrestricted execution fallback.
 
 ```bash
-git clone --branch rsi-original-parent-paired-v2 https://github.com/mingbo-yang/EvoMemory.git
+git clone --branch rsi-original-parent-paired-v3 https://github.com/mingbo-yang/EvoMemory.git
 cd EvoMemory
 python3.10 -m venv .venv
 source .venv/bin/activate

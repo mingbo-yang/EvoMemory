@@ -26,6 +26,18 @@ class ContractError(ValueError):
         self.draft = draft
 
 
+class ReviewOutputError(ContractError):
+    """A returned Reviewer response failed its format or evidence-citation contract."""
+
+
+class LearningMechanismError(RuntimeError):
+    """The deployed mechanism failed during formal learning and its task remains unscored."""
+
+    def __init__(self, evidence):
+        self.evidence = evidence
+        super().__init__(f"Deployed learning Hook failed on {evidence['task_id']}: {evidence['candidate_error']['message']}")
+
+
 class InfrastructurePending(RuntimeError):
     """A job did not return a usable receipt. Partial results never acquire a score."""
 
@@ -122,8 +134,12 @@ class _Journal:
             value = callback()
             # Normalize tuples etc. to ensure replay sees exactly what live execution saw.
             outcome = {"ok": True, "value": json.loads(canonical(value))}
+        except LearningMechanismError as error:
+            outcome = {"ok": False, "error_kind": "deployed_learning_hook", "error": str(error), "evidence": error.evidence}
         except ContractError as error:
             outcome = {"ok": False, "error": str(error), "draft": error.draft}
+            if isinstance(error, ReviewOutputError):
+                outcome["error_kind"] = "review_output"
         except BudgetExhausted:
             _write(attempt, {**intent, "status": "budget_exhausted"})
             raise
@@ -132,13 +148,17 @@ class _Journal:
                              "error_type": type(error).__name__, "error": str(error)})
             raise InfrastructurePending(f"{name}: {error}") from error
         _write(receipt, {"request_hash": key, "outcome": outcome, "outcome_hash": digest(outcome)})
-        _write(attempt, {**intent, "status": "finished"})
+        status = "learning_hook_failure" if outcome.get("error_kind") == "deployed_learning_hook" else "finished"
+        _write(attempt, {**intent, "status": status})
         return self._unwrap(outcome)
 
     @staticmethod
     def _unwrap(outcome):
         if not outcome["ok"]:
-            raise ContractError(outcome["error"], draft=outcome.get("draft"))
+            if outcome.get("error_kind") == "deployed_learning_hook":
+                raise LearningMechanismError(outcome["evidence"])
+            cls = ReviewOutputError if outcome.get("error_kind") == "review_output" else ContractError
+            raise cls(outcome["error"], draft=outcome.get("draft"))
         return outcome["value"]
 
 
@@ -151,10 +171,11 @@ def _draft_seed(slot_seed, index):
     return slot_seed if index == 0 else _seed(slot_seed, "repair", index)
 
 
-def _validate_panels(panels):
+def _validate_panels(panels, *, distinct_groups=True):
     if set(panels) != {"learning", "primary", "meta"}:
         raise ValueError("Expected exactly learning, primary and meta panels")
-    for field in ("id", "group_id", "game_sha256"):
+    fields = ("id", "group_id", "game_sha256") if distinct_groups else ("id", "archive_member", "game_sha256")
+    for field in fields:
         seen = set()
         for panel in panels.values():
             if not isinstance(panel, list) or not panel:
@@ -169,10 +190,18 @@ def _validate_panels(panels):
                     seen.add(value)
 
 
-def _validate_score(row, task):
+def _validate_score(row, task, *, classified=False):
     if (not isinstance(row, dict) or row.get("task_id") != task["id"]
             or type(row.get("score")) not in (float, int) or row["score"] not in (0, 1)):
         raise ValueError("A complete native evaluation must bind the registered task and a binary score")
+    if classified:
+        outcome = row.get("status")
+        if outcome == "completed" and type(row.get("native_score")) in (int, float) and row["native_score"] == row["score"]:
+            return
+        if (outcome == "method_eval_failure" and "native_score" in row and row["native_score"] is None
+                and row["score"] == 0 and isinstance(row.get("candidate_error"), dict) and row["candidate_error"]):
+            return
+        raise ValueError("Panel row lacks a verified native outcome or a documented candidate Hook penalty")
 
 
 def _public_episode(row, *, for_review=False):
@@ -215,6 +244,37 @@ def _public_record(record, *, for_review=False):
     return result
 
 
+def _published_records(records, gate_sources, *, for_review=False):
+    published = {key: _public_record(row, for_review=for_review) for key, row in records.items()}
+    if gate_sources:
+        for candidate in published.values():
+            for row in candidate.get("evaluation", []):
+                row["gate_source"] = gate_sources[row["task_id"]]
+    return published
+
+
+def _review_records(records, entries, phase, mother_hash, cutoff, retained=None):
+    by_id = {entry["task_id"]: entry for entry in entries}
+    published = _published_records(records, {i: e["source"] for i, e in by_id.items()}, for_review=True)
+    for name, view in published.items():
+        row = records[name]
+        origin_name, origin = retained if name == "retained" else (name, row)
+        source = row.get("source")
+        view["provenance"] = dict(
+            phase=phase, arm={"O": "old", "N": "new", "P": "primary"}.get(name[:1], "common"),
+            origin="primary_winner" if name == "retained" else "deployment" if name == "parent" else "proposal",
+            origin_slot=origin_name if origin_name != "parent" else None,
+            requested_evolver_hash=origin.get("requested_evolver_hash"), loaded_evolver_hash=origin.get("loaded_evolver_hash"),
+            program_hash=hashlib.sha256(source.encode()).hexdigest() if source is not None else None,
+            parent_snapshot_hash=mother_hash, learning_cutoff=cutoff, pre_eval_memory_hash=row.get("pre_memory_hash"),
+            evaluation_key=row.get("eval_key"))
+        for item in view.get("evaluation", []):
+            entry = by_id.get(item["task_id"], {})
+            if "episode_hash" in entry:
+                item["historical_learning"] = dict(episode_hash=entry["episode_hash"], round=entry["learning_round"])
+    return published
+
+
 def _choose(names, records):
     valid = [name for name in names if records[name].get("success_count") is not None]
     if not valid:
@@ -234,7 +294,8 @@ def _check_policy(old, new):
 
 
 class _Batch:
-    def __init__(self, root, state, panels, adapter, seed, force_pair, budget):
+    def __init__(self, root, state, panels, adapter, seed, force_pair, budget, learning_history_tasks=None,
+                 protocol=PROTOCOL):
         self.state, self.panels, self.api = state, panels, adapter
         self.seed, self.force_pair = seed, force_pair
         self.budget = budget
@@ -244,10 +305,23 @@ class _Batch:
         self.memory = deepcopy(state["memory"])
         self.ledger = deepcopy(state["ledger"])
         self.prepared = {}
+        self.gate_sources = {}
+        self.sampling = {}
         self.fingerprint = str(getattr(adapter, "fingerprint", type(adapter).__qualname__))
-        self.j.seal("registration", dict(protocol=PROTOCOL, repair_version=REPAIR_VERSION, state_hash=digest(state),
-                    panel_hash=digest(panels), panels=panels, seed=seed, force_pair=force_pair,
-                    budget=budget, adapter_fingerprint=self.fingerprint))
+        self.protocol = protocol
+        registration = dict(protocol=protocol, repair_version=REPAIR_VERSION, state_hash=digest(state),
+                            panel_hash=digest(panels), panels=panels, seed=seed, force_pair=force_pair,
+                            budget=budget, adapter_fingerprint=self.fingerprint)
+        self.learning_history_tasks = learning_history_tasks
+        if learning_history_tasks is not None:
+            registration["learning_history_tasks"] = learning_history_tasks
+            self.j.seal("starting_state", state)
+        self.j.seal("registration", registration)
+
+    def resolve_panels(self, ledger):
+        from .panel import resolve_family_panels
+        history = self.learning_history_tasks + self.panels["learning"]
+        return resolve_family_panels(self.panels, history, ledger, self.seed)
 
     def _packet(self, name, packet):
         value = (self.api.compress(deepcopy(packet)) if hasattr(self.api, "compress") else packet)
@@ -269,6 +343,16 @@ class _Batch:
         mother = dict(framework=self.original, memory=self.memory, learning_cutoff=len(self.ledger),
                       learning_hash=digest(self.ledger), batch_trajectory_hash=digest(recent),
                       configuration_hash=digest(_read(self.j.root / "registration.json")))
+        if self.learning_history_tasks is not None:
+            # Select from completed learning rows only. Proposal inputs include
+            # the snapshot identity, without revealing the prospective gates.
+            resolved = self.resolve_panels(self.ledger)
+            self.j.seal("resolved_panels", resolved)
+            mother["resolved_panels_hash"] = digest(resolved)
+            self.panels = resolved["panels"]
+            self.sampling = resolved["sampling"]
+            self.gate_sources = {entry["task_id"]: entry["source"] for gate in resolved["sampling"].values()
+                                 for entry in gate["entries"]}
         self.j.seal("parent_snapshot", mother)
         self.mother_hash = digest(mother)
         diagnosis = self.j.job("pre_review", self.mother_hash, lambda: self.api.diagnose(
@@ -345,24 +429,47 @@ class _Batch:
                 row.update(valid=False, error=str(error), success_count=None)
                 continue
             memory = self.prepared[key]
-            eval_key = digest([PROTOCOL, self.fingerprint, key, digest(memory),
+            eval_key = digest([self.protocol, self.fingerprint, key, digest(memory),
                                panel_name, tasks, seeds, "private-online-memory"])
             def evaluate():
                 results = self.api.evaluate(source, deepcopy(memory), deepcopy(tasks), list(seeds))
                 if not isinstance(results, list) or len(results) != len(tasks):
                     raise ValueError("Incomplete native panel")
                 for result, task in zip(results, tasks):
-                    _validate_score(result, task)
+                    _validate_score(result, task, classified=self.protocol != PROTOCOL)
                 return results
             rows = self.j.job(f"evaluation/{eval_key}", eval_key, evaluate)
             row.update(evaluation=rows, eval_key=eval_key, pre_memory_hash=digest(memory),
                        success_count=sum(int(item["score"]) for item in rows))
         self.j.seal(f"{panel_name}_results", records)
 
-    def _review(self, phase, records):
-        published = {key: _public_record(row, for_review=True) for key, row in records.items()}
-        return self.j.job(f"reviews/{phase}", digest(published), lambda:
-                          self.api.review(self.original, deepcopy(published)))
+    def _review(self, phase, records, *, retained=None):
+        if self.protocol == PROTOCOL:
+            published = _published_records(records, self.gate_sources, for_review=True)
+        else:
+            entries = self.sampling.get(phase, {}).get("entries", [])
+            published = _review_records(records, entries, phase, self.mother_hash, len(self.ledger), retained)
+        records_hash = digest(published)
+        errors = []
+        recoverable = phase == "meta" and self.protocol != PROTOCOL
+        try:
+            review = self.j.job(f"reviews/{phase}", records_hash, lambda:
+                                self.api.review(self.original, deepcopy(published)))
+        except ReviewOutputError as first:
+            if not recoverable:
+                raise
+            prior = {"error": str(first), "previous_response": first.draft}
+            errors.append(prior)
+            try:
+                review = self.j.job("reviews/meta_correction", [records_hash, prior], lambda:
+                                    self.api.review_retry(self.original, deepcopy(published), deepcopy(prior)))
+            except ReviewOutputError as second:
+                errors.append({"error": str(second), "previous_response": second.draft})
+                review = {"findings": []}
+        if recoverable:
+            status = ("available", "corrected", "missing")[len(errors)]
+            return dict(review, status=status, records_hash=records_hash, attempt_errors=errors)
+        return review
 
     def _commit(self, name, winner, evolver, status, event):
         bank = self.prepared[digest(winner["source"])]
@@ -389,12 +496,12 @@ class _Batch:
         self._evaluate(primary, "primary")
         keep = _choose(primary, primary)
         review = self._review("primary", primary)
-        public = {k: _public_record(v) for k,v in primary.items()}
+        public = _published_records(primary, self.gate_sources)
         ids = ["pre.diagnosis", "post.review", "primary.selection", *["primary." + k for k in primary]]
         shared = self._packet("H_shared", dict(phase="post_primary", pre=h_pre, primary=public,
                               retained=keep, review=review, evidence_ids=ids))
         decision, decision_error = None, None
-        for attempt in range(2):
+        for attempt in range(2 if self.protocol == PROTOCOL else 1):
             try:
                 def decide():
                     if attempt and hasattr(self.api, "decide_retry"):
@@ -448,9 +555,16 @@ class _Batch:
                                      source_hash=primary[keep]["source_hash"]),
                     "parent": dict(valid=True, source=self.original, source_hash=digest(self.original)), **arms}
             self._evaluate(meta, "meta")
-            event["meta_review"] = self._review("meta", meta)
         except BudgetExhausted:
             return fallback("meta_incomplete")
+        try:
+            event["meta_review"] = self._review("meta", meta, retained=(keep, primary[keep]))
+        except BudgetExhausted as exc:
+            if self.protocol == PROTOCOL:
+                return fallback("meta_incomplete")
+            # All scores already exist. A transport failure gives no Reviewer
+            # output to correct and cannot change which framework wins.
+            raise InfrastructurePending(f"Meta scores sealed; Reviewer infrastructure requires recovery: {exc}") from exc
         old_name = _choose(["retained","parent","O1","O2","O3"], meta)
         new_name = _choose(["retained","parent","N1","N2","N3"], meta)
         changed = meta[new_name]["success_count"] >= meta[old_name]["success_count"] + 1
@@ -462,7 +576,8 @@ class _Batch:
         return self._commit(chosen, meta[chosen], new if changed else self.old, "paired_complete", event)
 
 
-def run_batch(root, *, state, panels, adapter, seed=42, force_pair=False, budget=None):
+def run_batch(root, *, state, panels, adapter, seed=42, force_pair=False, budget=None,
+              learning_history_tasks=None, protocol=None):
     """Run or resume one frozen batch. Its only published state is commit.json.
 
     Adapter callbacks: learn(source, banks, task, seed) -> (banks, episode);
@@ -475,12 +590,34 @@ def run_batch(root, *, state, panels, adapter, seed=42, force_pair=False, budget
     seals one common bounded public packet. The optional reserve_pair(budget) checks
     non-episode resource reservations. A live adapter should bind its configuration,
     model, tokenizer, runtime and scorer in its fingerprint.
+
+    For a sequential family campaign, panels contains fresh learning tasks and
+    both gates' fresh reserves. Pass the previous learning tasks in ledger order
+    (an empty list for round one). The observed learning outcomes determine
+    the two sealed evaluation gates before any proposal is generated.
     """
+    from .panel import SEQUENTIAL_PROTOCOL
+    if protocol is None:
+        protocol = SEQUENTIAL_PROTOCOL if learning_history_tasks is not None else PROTOCOL
+    if protocol not in (PROTOCOL, SEQUENTIAL_PROTOCOL) or (learning_history_tasks is not None and protocol == PROTOCOL):
+        raise ValueError("Unknown or incompatible batch protocol")
     if not {"mechanism","evolver","memory","ledger","history"} <= set(state):
         raise ValueError("Incomplete deployment state")
     if not isinstance(state["evolver"], dict) or "propose" not in state["evolver"]:
         raise ValueError("Deployment requires an explicit proposal strategy")
-    _validate_panels(panels)
+    if learning_history_tasks is None:
+        _validate_panels(panels)
+    else:
+        from .panel import FAMILY_BATCH_SIZE
+        if (not isinstance(learning_history_tasks, list)
+                or [t["id"] for t in learning_history_tasks] != [row["task_id"] for row in state["ledger"]]):
+            raise ValueError("Registered historical tasks differ from the starting learning ledger")
+        if any(len(panels.get(phase, [])) != FAMILY_BATCH_SIZE for phase in ("learning", "primary", "meta")):
+            raise ValueError("Unexpected family round learning or fresh gate reserve size")
+        catalog = {**panels, "learning": learning_history_tasks + panels["learning"]}
+        _validate_panels(catalog, distinct_groups=False)
+        if len({t["family"] for tasks in catalog.values() for t in tasks}) != 1:
+            raise ValueError("A family round cannot mix task families")
     prior_ids = {row["task_id"] for row in state["ledger"]}
     if any(task["id"] in prior_ids for panel in panels.values() for task in panel):
         raise ValueError("A registered task already appears in the deployed learning ledger")
@@ -491,11 +628,17 @@ def run_batch(root, *, state, panels, adapter, seed=42, force_pair=False, budget
             raise ValueError(f"Invalid positive budget: {name}")
     root = Path(root)
     with _lock(root):
-        batch = _Batch(root, deepcopy(state), deepcopy(panels), adapter, seed, force_pair, budget)
+        batch = _Batch(root, deepcopy(state), deepcopy(panels), adapter, seed, force_pair, budget,
+                       deepcopy(learning_history_tasks), protocol)
         path = root/"commit.json"
         if path.exists():
             committed = _read(path)
             if digest(committed["state"]) != committed["state_hash"]:
                 raise ValueError("Damaged deployment commit")
+            if learning_history_tasks is not None:
+                resolved = batch.resolve_panels(committed["state"]["ledger"])
+                if (resolved != _read(root / "resolved_panels.json")
+                        or digest(resolved) != _read(root / "parent_snapshot.json")["resolved_panels_hash"]):
+                    raise ValueError("Frozen validation gates differ from the registered learning outcomes")
             return committed["state"]
         return batch.run()

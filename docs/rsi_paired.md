@@ -57,7 +57,7 @@ arguments. Each exclusion file is a JSON array of objects with `group_id` and
 `game_sha256`. The panel stores the task order, environment seeds and archive hashes.
 
 ```bash
-git clone --branch rsi-original-parent-paired-v2 https://github.com/mingbo-yang/EvoMemory.git
+git clone --branch rsi-original-parent-paired-v3 https://github.com/mingbo-yang/EvoMemory.git
 cd EvoMemory
 python3.10 -m venv .venv
 source .venv/bin/activate
@@ -72,7 +72,7 @@ curl --fail --noproxy '*' "${EVOMEMORY_BASE_URL}/models"
 # Example only. Use a positive integer no larger than the advertised max_model_len.
 export MODEL_CONTEXT_TOKENS=262144
 python -m scripts.prepare_assets alfworld
-python -m rsi_paired prepare-smoke \
+python -m rsi_paired prepare-smoke --v3 \
   --games data/downloads/alfworld-tw-0.4.2.zip \
   --metadata data/downloads/json_2.1.1_json.zip \
   --out runs/panel.json

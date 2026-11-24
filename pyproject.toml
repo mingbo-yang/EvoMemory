@@ -42,6 +42,11 @@ exclude = ["tests*"]
 [tool.pytest.ini_options]
 testpaths = [
   "tests/test_rsi_panel.py",
+  "tests/test_rsi_family_panel.py",
+  "tests/test_rsi_family_workflow.py",
+  "tests/test_rsi_family_comparison.py",
+  "tests/test_rsi_family_campaign.py",
+  "tests/test_rsi_family_capacity.py",
   "tests/test_rsi_audit.py",
   "tests/test_rsi_repair_audit.py",
   "tests/test_rsi_workflow.py",

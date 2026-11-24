@@ -8,7 +8,8 @@ from pathlib import Path
 
 from phase1_codegen.outcomes import candidate_hook_failure
 
-from .workflow import ContractError, REPAIR_VERSION, _draft_seed, _seed, digest
+from .workflow import (ContractError, LearningMechanismError, PROTOCOL, REPAIR_VERSION, _draft_seed, _public_episode,
+                       _review_records, _seed, _validate_score, digest)
 
 
 def read(path):
@@ -44,6 +45,7 @@ class Audit:
         self.slots = {}
         self.intents = {}
         self.native_rows = {}
+        self.learning_failures = {}
         self.native_origins = set()
         self.native_verified = set()
         self.native_missing_wire = []
@@ -95,8 +97,11 @@ class Audit:
             self.native_fingerprint = read(root / "runtime.json").get("native_fingerprint")
         for path in (root/"native/episodes").glob("*/complete.json"):
             self._index_native(path)
+        for path in (root/"native/episodes").glob("*/learning_failure.json"):
+            self._index_native(path)
         self.check(len(self.native_origins) <= 1, "Native jobs come from different original run directories")
-        costs["completed_native_episodes"] = len(self.native_rows)
+        costs["completed_native_episodes"] = len(self.native_rows) - len(self.learning_failures)
+        costs["unscored_learning_failures"] = len(self.learning_failures)
         costs["native_attempt_directories"] = sum(1 for _ in (root/"native/episodes").glob("*/attempt-*"))
         self.report["native_wire"] = dict(verified=self.ordered_wire_verified,
                                           unavailable_legacy_panels=sorted(self.native_missing_wire))
@@ -126,7 +131,11 @@ class Audit:
                        "Missing or invalid native ordered episode witness")
         learning = binding["scope"] == "learning"
         archive = self.root / "native/learning" / (episode_hash + ".json")
-        if learning:
+        blocked = path.name == "learning_failure.json"
+        if blocked:
+            self.check(learning and not archive.exists() and not (path.parent / "complete.json").exists(),
+                       "Blocked learning was also published as a completion or experience")
+        elif learning:
             self.check(archive.is_file() and file_hash(archive) == episode_hash, "Native learning archive changed")
         witness = exact if exact.is_file() else archive if learning and archive.is_file() else None
         exact_bytes = witness.read_bytes() if witness else None
@@ -145,14 +154,21 @@ class Audit:
                  and ep["seed"] == binding["seed"] and ep["program_hash"] == binding["source"]
                  and ep["synthetic"] is False and row["native_score"] == ep["score"]
                  and ep.get("error") == row.get("error"))
-        valid &= type(row["score"]) in (int, float) and row["score"] in (0, 1)
-        if row["status"] == "method_eval_failure":
+        if blocked:
+            from .native import _candidate_error
+            valid &= (row["status"] == "deployed_learning_hook_failure" and row["score"] is None
+                      and ep["executor"] == 'ALMA.Agent_Workflow.run_single_task' and ep['native_reward_verified'] is False
+                      and ep["score"] is None and candidate_hook_failure(ep, binding["source"])
+                      and row["candidate_error"] == _candidate_error(ep) and not ep["memory_hook"]["committed"]
+                      and ep["generated_memory_write_calls"] == 0 and ep["memory_hash_before"] == ep["memory_hash_after"])
+        elif row["status"] == "method_eval_failure":
             valid &= (not learning and row["score"] == 0 and ep["score"] is None
                       and candidate_hook_failure(ep, binding["source"]))
         else:
             recorder = ep["native_recorder"]
             reward = recorder["steps"][-1]["scores"] if recorder["steps"] else 0
-            valid &= (row["status"] == "completed" and not ep["error"] and ep["native_reward_verified"] is True
+            valid &= (type(row["score"]) in (int, float) and row["score"] in (0, 1)
+                      and row["status"] == "completed" and not ep["error"] and ep["native_reward_verified"] is True
                       and row["score"] == reward == recorder["reward"] == ep["score"])
         self.check(valid, "A completed native task does not reproduce its reported outcome")
         self.check(snapshot["snapshot_hash"] == digest({k:v for k,v in snapshot.items() if k != "snapshot_hash"})
@@ -167,6 +183,9 @@ class Audit:
             raise ValueError("Unexpected native job path")
         self.native_origins.add(job_path.parents[4])
         key = ("/".join(parts[-3:-1]), binding["index"])
+        if blocked:
+            from .native import learning_failure_evidence
+            self.learning_failures[key] = learning_failure_evidence(path.parent, result)
         self.check(key not in self.native_rows, f"Duplicate native receipt for {key}")
         self.native_rows[key] = (binding, row, snapshot, ep["environment_seed"], ep["memory_hash_before"])
 
@@ -197,7 +216,7 @@ class Audit:
                    and actual["task_id"] == task["id"] and actual["family"] == family and env_seed == task["seed"]
                    and before_hash == before["memory_hash"] and json.loads(after["context_wire"])["family"] == family
                    and (row is None or digest(actual) == digest(row)), f"Native task binding mismatch for {job}/{index}")
-        if actual["status"] == "method_eval_failure":
+        if actual["status"] in ("method_eval_failure", "deployed_learning_hook_failure"):
             self.check(after == before, f"Failed native candidate changed memory for {job}/{index}")
             return bank
         self.check(after["family"] == family and after["source_log_hash"] ==
@@ -416,6 +435,9 @@ class Audit:
             self.check([r["task_id"] for r in outcomes] == [t["id"] for t in tasks]
                        and all(type(r["score"]) in (int,float) and r["score"] in (0,1) for r in outcomes)
                        and sum(r["score"] for r in outcomes) == row["success_count"], f"Incomplete scores {phase}/{n}")
+            if registered["protocol"] != PROTOCOL:
+                for episode, task in zip(outcomes, tasks):
+                    _validate_score(episode, task, classified=True)
             if self.real:
                 self.bind_panel(key, tasks, seeds, source, bank, outcomes)
             scores[n] = row["success_count"]
@@ -432,6 +454,134 @@ class Audit:
                                               valid_versions=len(evals), distinct_panel_executions=len(set(evals.values())))
         return records
 
+    def _displayed_evidence(self, rows, omission):
+        from .roles import _evidence_counts
+        originals = {path + "/evidence": row["evidence"] for path, row, shown in rows
+                     if "evidence" in row and isinstance(shown.get("evidence"), dict)}
+        reduced = []
+        for path, row, shown in rows:
+            facts, visible = row.get("evidence"), shown.get("evidence")
+            self.check(all(row.get(k) == shown.get(k) for k in
+                           ("task_id", "score", "native_score", "episode_hash", "status")),
+                       f"Shared evidence differs from its episode identity or native result: {path}")
+            if "evidence_ref" in shown:
+                ref = shown["evidence_ref"]
+                self.check("evidence" not in shown and ref in originals and originals[ref] == facts,
+                           f"Shared evidence reference differs from its episode: {path}/evidence")
+            elif facts != visible:
+                fingerprint = digest(facts)
+                self.check(isinstance(facts, dict) and visible == _evidence_counts(facts)
+                           and (shown.get("episode_hash") or shown.get("full_witness_hash") == fingerprint),
+                           f"Directly displayed evidence differs from the archived facts: {path}")
+                reduced.append([path, fingerprint])
+        expected = ({"episode_witnesses_reduced": len(reduced), "witnesses_hash": digest(reduced)}
+                    if reduced else None)
+        self.check(omission == expected, "Displayed evidence omission receipt differs from the archived facts")
+
+    def family_feedback(self, shared, primary, recent_rows):
+        """Resolve any deduplicated public values against the original episode and source."""
+        slots = shared["primary"]
+        sources = {f"/primary/{name}/source": val["source"] for name, val in slots.items()
+                   if isinstance(val.get("source"), str)}
+        # An evidence reference must end at a directly displayed row. Equality
+        # is checked on the inputs to compaction, including any prior H_pre omissions.
+        pre = self.load("H_pre.json")
+        recent = pre.get("recent_learning", [])
+        visible = shared["pre"].get("recent_learning", [])
+        self.check(len(recent_rows) == len(recent) == len(visible), "Shared feedback omits registered recent learning rows")
+        self._displayed_evidence([(f"/recent_learning/{i}", _public_episode(row), shown)
+                                  for i, (row, shown) in enumerate(zip(recent_rows, recent))], pre.get("omission"))
+        rows = [(f"/pre/recent_learning/{i}", original, shown)
+                for i, (original, shown) in enumerate(zip(recent, visible))]
+        sampling = self.report.get("panel_sampling")
+        for name, record in primary.items():
+            view = slots[name]
+            if "source_ref" in view:
+                self.check("source" not in view and view["source_ref"] in sources
+                           and sources[view["source_ref"]] == record["source"],
+                           f"Shared source reference differs from the actual candidate: {name}")
+            else:
+                self.check(view.get("source") == record["source"],
+                           f"Shared source differs from the actual candidate: {name}")
+            if "evaluation" not in record:
+                continue
+            evaluated = record["evaluation"]
+            shown = view.get("evaluation", [])
+            expected = [(r["task_id"], sampling["primary"]["entries"][i]["source"] if sampling else None, r["score"])
+                        for i, r in enumerate(evaluated)]
+            labels = [(r.get("task_id"), r.get("gate_source"), r.get("score")) for r in shown]
+            self.check(labels == expected, f"Shared feedback mislabels primary evaluation rows: {name}")
+            rows.extend((f"/primary/{name}/evaluation/{i}", _public_episode(row), displayed)
+                        for i, (row, displayed) in enumerate(zip(evaluated, shown)))
+        self._displayed_evidence(rows, shared.get("omission"))
+
+    def review_receipts(self, phase, records, mother, reported, retained=None):
+        from .roles import _displayed_hash, _review_findings, _review_witness_index, _score_view, decode_role_response
+        names = ["parent", "P1", "P2", "P3"] if phase == "primary" else [
+            "retained", "parent", "O1", "O2", "O3", "N1", "N2", "N3"]
+        entries = self.report.get("panel_sampling", {}).get(phase, {}).get("entries", [])
+        published = _review_records({name: records[name] for name in names}, entries, phase, digest(mother),
+                                    mother["learning_cutoff"], retained)
+        records_hash = digest(published)
+        evidence = {"parent.source": mother["framework"], **{f"{phase}.{k}": _score_view(r) for k, r in published.items()}}
+        witnesses = _review_witness_index(evidence)
+        errors = []
+        value = None
+        for job in ([f"reviews/{phase}"] if phase == "primary" else ["reviews/meta", "reviews/meta_correction"]):
+            rec = self.outcome(job)
+            if value is not None:
+                self.check(not (self.batch / "jobs" / job).exists(), "A successfully returned meta review was corrected again")
+                continue
+            if not self.check(rec is not None, f"Missing scored-panel review receipt: {job}"):
+                return
+            prior = errors[-1] if errors else None
+            self._job_binding(job, [records_hash, prior] if prior else records_hash)
+            if self.real:
+                # Bind the actual model request and response to this journal job.
+                matched = []
+                for key, sends in self.intents.items():
+                    item = sends[0]
+                    if item["role"] != "review":
+                        continue
+                    binding = {k: item[k] for k in ("role", "model_fingerprint", "policy_hash", "request")}
+                    if digest(dict(binding, job=f"batch/jobs/{job}/private")) == key:
+                        matched.append(key)
+                if not self.check(len(matched) == 1, f"Unbound Reviewer model request: {job}"):
+                    return
+                key, = matched
+                request = self.intents[key][0]["request"]
+                body = json.loads(request["messages"][-1]["content"])
+                kept = body.get("episode_witnesses", {})
+                self.check(body["evidence"] == evidence and kept == dict(list(witnesses.items())[:len(kept)])
+                           and body.get("omitted_witness_count", 0) == len(witnesses) - len(kept)
+                           and body.get("format_correction") == prior,
+                           f"Reviewer saw different evidence, attribution or correction: {job}")
+                wire_hash = _displayed_hash(body)
+                response = read(self.root / "roles/requests" / key / "response.json")
+                try:
+                    actual = _review_findings(decode_role_response(response, request["model"]), evidence)
+                except ContractError as exc:
+                    bad = dict(request_key=key, response_hash=digest(response),
+                               output_hash=digest(response["choices"][0]["message"].get("content")),
+                               displayed_evidence_hash=wire_hash)
+                    self.check(not rec["ok"] and rec["error"] == str(exc) and rec["draft"] == bad,
+                               f"Reviewer rejection differs from its model response: {job}")
+                except RuntimeError as exc:
+                    self.check(False, f"Invalid Reviewer response identity for {job}: {exc}")
+                else:
+                    self.check(rec["ok"] and rec["value"] == dict(actual, evidence_hash=wire_hash),
+                               f"Reviewer opinion differs from its model response: {job}")
+            if rec["ok"]:
+                value = rec["value"]
+            else:
+                self.check(phase == "meta" and rec.get("error_kind") == "review_output",
+                           f"A non-format failure was processed as a Reviewer correction: {job}")
+                errors.append({"error": rec["error"], "previous_response": rec.get("draft")})
+        if phase == "meta":
+            value = dict(value or {"findings": []}, records_hash=records_hash, attempt_errors=errors,
+                         status=("available", "corrected", "missing")[len(errors)])
+        self.check(reported == value, f"Published {phase} review differs from counted attempts")
+
     def inspect(self):
         self.costs_and_wire()
         job_root = self.batch/"jobs"
@@ -446,6 +596,26 @@ class Audit:
         if not registration:
             self.report["stage"] = "awaiting_batch_registration"
             return
+        from .panel import SEQUENTIAL_PROTOCOL
+        v3 = registration["protocol"] == SEQUENTIAL_PROTOCOL
+        self.check(v3 or registration["protocol"] == PROTOCOL, "Unknown registered batch protocol")
+        if v3:
+            decision_dirs = {p.name for p in (self.batch/"jobs/decision").glob("*") if p.is_dir()}
+            self.check(decision_dirs <= {"0"}, "v3 allocated a second self-decision opportunity")
+            reviews = {p.name for p in (self.batch/"jobs/reviews").glob("*") if p.is_dir()}
+            self.check(reviews <= {"primary", "meta", "meta_correction"}, "v3 allocated an unregistered review")
+            decisions = {k: sends for k, sends in self.intents.items() if sends[0]["role"] == "decide"}
+            self.report["self_decision"] = dict(journal_slots=len(decision_dirs), request_keys=len(decisions),
+                                                physical_sends=sum(map(len, decisions.values())))
+            self.check(len(decisions) <= 1, "v3 sent multiple logical self-decision requests")
+            for key, sends in decisions.items():
+                for item in sends:
+                    binding = {k: item[k] for k in ("role", "model_fingerprint", "policy_hash", "request")}
+                    body = json.loads(item["request"]["messages"][-1]["content"])
+                    self.check(digest(dict(binding, job="batch/jobs/decision/0/private")) == key
+                               and body.get("public_evidence") == self.load("H_shared.json")
+                               and set(body) == {"public_evidence", "current_strategy"},
+                               "v3 decision request differs from its first sealed opportunity")
         if "repair_version" in registration:
             self.check(type(registration["repair_version"]) is int and registration["repair_version"] == REPAIR_VERSION,
                        "Unsupported repair receipt version")
@@ -455,7 +625,16 @@ class Audit:
         starting = self.load("starting_state.json")
         if starting is not None:
             self.check(digest(starting) == registration["state_hash"], "Starting state differs from registration")
-        self.report["learning_receipts"] = len(list((self.batch/"jobs/learning").glob("*/result.json")))
+        learning_jobs = {p.parent.name: self.outcome(f"learning/{p.parent.name}") for p in
+                         (self.batch/"jobs/learning").glob("*/result.json")}
+        blocked = {n: out for n, out in learning_jobs.items() if out.get("error_kind") == "deployed_learning_hook"}
+        self.report["learning_receipts"] = sum(out["ok"] for out in learning_jobs.values())
+        if blocked:
+            n, out = min(blocked.items())
+            self.check(v3 and len(blocked) == 1 and n == max(learning_jobs) and not mother
+                       and not (self.batch / "commit.json").exists(),
+                       "A deployed learning failure advanced or committed the round")
+            self.report["blocked_learning"] = out["evidence"]
         if self.real:
             from phase1_codegen.program import BASELINE_SOURCE
             source = starting["mechanism"] if starting is not None else BASELINE_SOURCE
@@ -467,6 +646,11 @@ class Audit:
                 outcome = self.outcome(job)
                 seed = int(digest([registration["seed"], "native", task["id"]])[:8], 16) % 2147483647
                 row = outcome["value"][1] if outcome and outcome["ok"] else None
+                if outcome and outcome.get("error_kind") == "deployed_learning_hook":
+                    self._job_binding(job, [digest(source), digest(bank), task, seed])
+                    self.check(outcome["evidence"] == self.learning_failures.get((job, 0))
+                               and outcome["error"] == str(LearningMechanismError(outcome["evidence"])),
+                               f"Deployed learning failure differs from the native receipt: {job}")
                 updated = self.bind_native(job, 0, task, seed, source_hash, None, bank, row)
                 if row is not None:
                     self.check(outcome["value"][0] == updated, f"Learning job returned a different memory: {job}")
@@ -475,7 +659,7 @@ class Audit:
                                f"Learning job request mismatch: {job}")
                 bank = updated
         if not mother:
-            self.report["stage"] = "collecting_learning_episodes"
+            self.report["stage"] = "blocked_deployed_learning_hook" if blocked else "collecting_learning_episodes"
             return
         self.check(mother["configuration_hash"] == digest(registration), "Mother differs from registration")
         recent = [self.outcome(f"learning/{i:03d}")["value"] for i in range(len(registration["panels"]["learning"]))]
@@ -484,6 +668,23 @@ class Audit:
         self.check(digest(recent_rows) == mother["batch_trajectory_hash"]
                    and (starting is None or digest(earlier + recent_rows) == mother["learning_hash"])
                    and recent[-1][0] == mother["memory"], "Mother differs from the learning receipts")
+        self.check(("resolved_panels_hash" in mother) == ("learning_history_tasks" in registration),
+                   "Validation gate protocol differs from the registered selection mode")
+        if "learning_history_tasks" in registration:
+            from .panel import resolve_family_panels
+            if not self.check(starting is not None, "Historical sampling lacks its starting learning ledger"):
+                return
+            plan = registration["panels"]
+            resolved = resolve_family_panels(plan, registration["learning_history_tasks"] + plan["learning"],
+                                             earlier + recent_rows, registration["seed"])
+            if not self.check(self.load("resolved_panels.json") == resolved
+                              and mother.get("resolved_panels_hash") == digest(resolved),
+                              "Resolved validation gates differ from the registered learning outcomes"):
+                return
+            # The registration hash in the mother binds the original fresh
+            # reserves. Native evaluation jobs bind the gates resolved above.
+            registration = {**registration, "panels": resolved["panels"]}
+            self.report["panel_sampling"] = resolved["sampling"]
         old_hash = None
         revision = self.outcome("revision")
         new_hash = digest(revision["value"]) if revision and revision["ok"] else None
@@ -535,12 +736,19 @@ class Audit:
                 self.check(displayed.get("success_count") == row.get("success_count")
                            and displayed.get("source_hash") == row.get("source_hash"),
                            f"Shared feedback misstates primary candidate {name}")
+            if v3:
+                self.family_feedback(shared, primary, recent_rows)
+                self.review_receipts("primary", primary, mother, shared["review"])
         meta = self.panel("meta",registration,mother,(primary,keep))
         if commit is None:
             self.report["stage"] = "decision_revision_or_paired_search" if meta is None else "awaiting_final_commit"
+            if v3 and meta is not None and any(j["job"].startswith("reviews/meta") for j in self.report["unresolved_jobs"]):
+                self.report["stage"] = "awaiting_meta_reviewer_recovery"
             return
         state = commit["state"]
         event = state["history"][-1]
+        if v3 and meta is not None:
+            self.check(event["status"] == "paired_complete", "Sealed meta scores cannot be discarded by fallback")
         self.check(digest(state) == commit["state_hash"] and event["primary_best"] == keep
                    and digest(state["ledger"]) == mother["learning_hash"]
                    and len(state["ledger"]) == event["learning_cutoff"] == mother["learning_cutoff"]
@@ -552,6 +760,8 @@ class Audit:
         result = dict(status=event["status"], forced_engineering=event["forced_pair"], primary=keep)
         selected, records, policy_hash = keep, primary, old_hash
         if event["status"] == "paired_complete":
+            if v3:
+                self.review_receipts("meta", meta, mother, event["meta_review"], (keep, primary[keep]))
             old = winner(meta,["retained","parent","O1","O2","O3"])
             new = winner(meta,["retained","parent","N1","N2","N3"])
             adopted = meta[new]["success_count"] >= meta[old]["success_count"] + 1
@@ -572,6 +782,10 @@ class Audit:
         decision = next((out["value"] for i in (0,1)
                          if (out := self.outcome(f"decision/{i}")) and out["ok"]), None)
         self.check(event["decision"] == decision, "Trigger decision disagrees with its durable receipt")
+        if v3 and event["status"] == "decision_error":
+            first = self.outcome("decision/0")
+            self.check(first is not None and not first["ok"] and event["decision"] is None,
+                       "Invalid v3 self-decision lacks its first and only rejection")
         if event["status"] == "not_triggered":
             self.check(decision is not None and not decision["should_update"] and not event["forced_pair"],
                        "Fallback does not follow original trigger decision")

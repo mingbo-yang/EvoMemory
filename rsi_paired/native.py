@@ -17,7 +17,8 @@ from phase1_codegen.outcomes import candidate_hook_failure
 from phase1_codegen.policy import Rejected
 from phase1_codegen.program import BASELINE_SOURCE, Program, WorkerStartupError
 from . import witness
-from .workflow import _sync_directory, _write
+from .panel import SEQUENTIAL_PROTOCOL
+from .workflow import LearningMechanismError, PROTOCOL, _sync_directory, _write
 
 
 def _wire(episode):
@@ -55,6 +56,20 @@ def _archive_episode(attempt, episode, learning_dir=None):
 
 def _prefix(previous, episode_hash):
     return digest([previous, episode_hash])
+
+
+def learning_failure_evidence(directory, result):
+    row = result['row']
+    return dict(task_id=row['task_id'], native_score=None, episode_hash=row['episode_hash'],
+                candidate_error=row['candidate_error'], result_hash=digest(result),
+                receipt=f'native/episodes/{directory.name}/learning_failure.json')
+
+
+def _candidate_error(ep):
+    rejected, = (e for e in ep['memory_hook']['events'] if e.get('status') == 'rejected')
+    message = rejected['error']
+    return dict(event=rejected['event']['type'], step=rejected['event']['step'], error_type=rejected['error_type'],
+                message=message[:1024], omitted_chars=max(0, len(message)-1024), error_hash=digest(message))
 
 
 def _evidence(ep, before, after, actors, *, episode_hash=None):
@@ -116,19 +131,23 @@ def _verify_completed(ep, task, label, seed, actors, before, bank):
 class Native:
     """Each public bank is a mapping from family to a validated, exact-program snapshot."""
 
-    def __init__(self, root, tasks, tokenizer, model_fingerprint, *, base_url, model_name, capabilities=None, learning_archive=None):
+    def __init__(self, root, tasks, tokenizer, model_fingerprint, *, base_url, model_name, capabilities=None,
+                 learning_archive=None, protocol=PROTOCOL):
         self.root = Path(root).resolve()
         self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.tokenizer = tokenizer
         self.capabilities = capabilities
+        self.protocol = protocol
         self.learning_archive = Path(learning_archive) if learning_archive is not None else self.root / "learning"
         self.engine = NativeEvaluator(self.root, tasks, tokenizer, model_fingerprint,
                                       {'environment': 'alfworld', 'memory_scope': 'family'},
                                       capabilities=capabilities, base_url=base_url, model_name=model_name)
         self.model_name = model_name
         self.model_fingerprint = model_fingerprint
-        self.fingerprint = digest(dict(adapter=file_hash(__file__), witness=file_hash(witness.__file__),
-                                       engine=self.engine.fingerprint))
+        identity = dict(adapter=file_hash(__file__), witness=file_hash(witness.__file__), engine=self.engine.fingerprint)
+        if protocol != PROTOCOL:
+            identity['protocol'] = protocol
+        self.fingerprint = digest(identity)
         self.job = None
 
     def close(self):
@@ -241,7 +260,12 @@ class Native:
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         with (directory/'lock').open('a') as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
+            blocked = directory/'learning_failure.json'
             complete = directory/'complete.json'
+            if blocked.is_file():
+                if complete.exists():
+                    raise ValueError('Learning task has both a failure and a completion')
+                complete = blocked
             if complete.is_file():
                 result = read(complete)
                 if result['binding'] != binding or result['result_hash'] != digest(result['result']):
@@ -253,11 +277,17 @@ class Native:
                         or file_hash(raw/'canonical_episodes.jsonl') != result['canonical_hash']
                         or file_hash(raw/'actor.jsonl') != result['actor_hash']):
                     raise ValueError('Native receipt contents changed')
-                if label == 'learning':
+                if label == 'learning' and complete != blocked:
                     self._learning_episode(result['row'])
             else:
                 result = self._execute(directory, program, bank, before, task, seed, label)
+                if result['row']['status'] == 'deployed_learning_hook_failure':
+                    complete = blocked
                 _write(complete, dict(binding=binding, result=result, result_hash=digest(result)))
+            if complete == blocked:
+                if result['row']['status'] != 'deployed_learning_hook_failure' or label != 'learning':
+                    raise ValueError('Invalid deployed learning failure receipt')
+                raise LearningMechanismError(learning_failure_evidence(directory, result))
             if result['row']['status'] == 'method_eval_failure':
                 return dict(memory), result['row']
             updated = dict(memory)
@@ -292,17 +322,25 @@ class Native:
                            or r.get('original_message_hash') != digest(r['messages']) for r in actors)):
                 raise RuntimeError('Native Actor receipts differ from registered task, request or model')
             failure = bool(ep.get('error'))
+            learning_failure = failure and label == 'learning' and self.protocol == SEQUENTIAL_PROTOCOL
             if failure:
-                if label != 'panel' or not candidate_hook_failure(ep, program.hash):
+                if (label != 'panel' and not learning_failure) or not candidate_hook_failure(ep, program.hash):
                     raise RuntimeError('Native task incomplete: ' + str(ep['error']))
                 if bank.fingerprint != before['memory_hash'] or ep['generated_memory_write_calls']:
                     raise RuntimeError('Failed candidate changed its private bank')
+                if learning_failure and not (
+                        ep['task_id'] == task['id'] and ep['phase'] == label and ep['family'] == task['family']
+                        and ep['environment'] == 'alfworld' and ep['seed'] == seed and ep['environment_seed'] == task['seed']
+                        and ep['executor'] == 'ALMA.Agent_Workflow.run_single_task' and ep['synthetic'] is False
+                        and ep['native_reward_verified'] is False and ep['score'] is None and not ep['memory_hook']['committed']
+                        and ep['memory_hash_before'] == ep['memory_hash_after'] == before['memory_hash']):
+                    raise RuntimeError('Incomplete binding for a deployed learning Hook failure')
             else:
                 _verify_completed(ep, task, label, seed, actors, before, bank)
         except Exception as exc:
             write(dest/'infrastructure.json', dict(kind=type(exc).__name__, detail=str(exc)))
             raise
-        ep_hash = _archive_episode(dest, ep, self.root/'learning' if label == 'learning' else None)
+        ep_hash = _archive_episode(dest, ep, self.root/'learning' if label == 'learning' and not failure else None)
         if not failure:
             bank.source_log_hash = _prefix(bank.source_log_hash, ep_hash)
         snapshot = bank.export_snapshot()
@@ -311,12 +349,9 @@ class Native:
                    episode_hash=ep_hash, native_score=ep['score'], score=0 if failure else int(ep['score']),
                    status='method_eval_failure' if failure else 'completed', error=ep.get('error'),
                    evidence=evidence, cost=cost)
+        if learning_failure:
+            row.update(status='deployed_learning_hook_failure', score=None)
         if failure:
-            rejected, = (e for e in ep['memory_hook']['events'] if e.get('status') == 'rejected')
-            message = rejected['error']
-            row['candidate_error'] = dict(event=rejected['event']['type'],
-                step=rejected['event']['step'], error_type=rejected['error_type'],
-                message=message[:1024], omitted_chars=max(0, len(message)-1024),
-                error_hash=digest(message))
+            row['candidate_error'] = _candidate_error(ep)
         return dict(row=row, snapshot=snapshot, attempt=dest.name, episode_wire='episode.json',
                     canonical_hash=file_hash(dest/'canonical_episodes.jsonl'), actor_hash=file_hash(ledger))

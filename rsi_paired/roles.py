@@ -19,7 +19,7 @@ from phase1_codegen.program import Program, WorkerStartupError
 from phase1_codegen.protocol import EVENT_CONTRACT, HOOK_VERSION
 from phase1_codegen.roles.evolver import HOOK_INTERFACE_PROMPT, LANGUAGE_RULES_PROMPT
 from phase1_codegen.roles.reviewer import REVIEW_RUBRIC
-from .workflow import ContractError, digest
+from .workflow import ContractError, ReviewOutputError, digest
 
 
 INITIAL_STRATEGY = {
@@ -143,10 +143,53 @@ def _program(package):
         raise ContractError(str(exc)) from exc
 
 
+def _public_rows(packet):
+    prefix = '/pre' if 'pre' in packet else ''
+    for i, row in enumerate(packet.get('pre', packet).get('recent_learning', [])):
+        yield f'{prefix}/recent_learning/{i}', row
+    for slot, record in packet.get('primary', {}).items():
+        for i, row in enumerate(record.get('evaluation', [])):
+            yield f'/primary/{slot}/evaluation/{i}', row
+
+
+def _policy_evidence(packet):
+    """Expand only direct references to values already displayed in this public packet."""
+    slots = packet.get('primary', {})
+    if not slots:
+        return packet
+    view = deepcopy(packet)
+    slots = view['primary']
+    rows = list(_public_rows(view))
+    # Build from direct fields before resolving anything. A reference can never
+    # point into a draft, another reference, hidden archive, or external file.
+    fields = [('source', [(f'/primary/{slot}', record) for slot, record in slots.items()], str),
+              ('evidence', rows, dict)]
+    for field, items, kind in fields:
+        direct = {f'{path}/{field}': item[field] for path, item in items if isinstance(item.get(field), kind)}
+        ref_name = field + '_ref'
+        for _, item in items:
+            if ref_name not in item:
+                continue
+            ref = item.pop(ref_name)
+            if field in item or not isinstance(ref, str) or ref not in direct:
+                raise ValueError(f'Invalid displayed public {field} reference')
+            value = direct[ref]
+            if field == 'source' and 'source_hash' in item and digest(value) != item['source_hash']:
+                raise ValueError('Public source reference differs from its registered source')
+            item[field] = value
+    return view
+
+
+def _evidence_counts(facts):
+    fields = ('events', 'steps', 'model_calls', 'stored_tokens_before', 'stored_tokens_after',
+              'exposed_memory_changes')
+    return {k: facts[k] for k in fields if isinstance(facts.get(k), (int, float))}
+
+
 def policy_instruction(package, evidence, repairing):
     program = _program(package)
     try:
-        result = program.run('event', {}, {'evidence': evidence, 'repairing': repairing}, {})
+        result = program.run('event', {}, {'evidence': _policy_evidence(evidence), 'repairing': repairing}, {})
     except WorkerStartupError:
         raise
     except Rejected as exc:
@@ -247,7 +290,8 @@ def _compact_experiences(events, tokens):
         for mod in event.get('modification_records', []):
             label = mod['slot']
             group = 'primary' if label.startswith('P') else 'meta'
-            findings = event.get(group + '_review', {}).get('findings', [])
+            review = event.get(group + '_review', {})
+            findings = review.get('findings', [])
             opinions = [f['judgment'] for f in findings if group + '.' + label in f['evidence_ids']]
             lines = mod.get('diff_excerpt', [])
             fragments = [s for line in lines if (s := _safe_diff_line(line))]
@@ -257,6 +301,10 @@ def _compact_experiences(events, tokens):
                           reviewer_judgments=opinions, partial_code_fragments=fragments,
                           undisplayed_lines=mod.get('omitted_lines', 0) + len(lines) - len(fragments),
                           truncated_lines=mod.get('truncated_lines', 0))
+            if group == 'meta' and 'status' in review:
+                record['review_status'] = review['status']
+                record['review_format_failures'] = len(review.get('attempt_errors', []))
+                record['review_records_hash'] = review['records_hash']
             while fragments and tokens.count(dumps(record)) > RECORD_TOKENS:
                 fragments.pop()
                 record['undisplayed_lines'] += 1
@@ -273,6 +321,26 @@ def _evidence_ids(ids, available):
     # Repeating a citation adds no evidence. Keep first-citation order in the
     # downstream record while the model's original response remains on disk.
     return list(dict.fromkeys(ids))
+
+
+def _review_findings(response, evidence):
+    findings = response.get('findings')
+    if set(response) != {'findings'} or not isinstance(findings, list) or not 1 <= len(findings) <= 8:
+        raise ContractError('Reviewer must return one to eight findings')
+    reviewed = []
+    for finding in findings:
+        if (not isinstance(finding, dict) or set(finding) != {'evidence_ids', 'judgment', 'observation'}
+                or not isinstance(finding['judgment'], str) or finding['judgment'] not in FINDING_KINDS
+                or not _text(finding['observation'])):
+            raise ContractError('Reviewer finding lacks a bound judgment, observation or evidence citation')
+        reviewed.append({**finding, 'evidence_ids': _evidence_ids(finding['evidence_ids'], evidence)})
+    return {'findings': reviewed}
+
+
+def _displayed_hash(body):
+    if 'episode_witnesses' not in body:
+        return digest(body['evidence'])
+    return digest({k: body[k] for k in ('evidence', 'episode_witnesses', 'omitted_witness_count')})
 
 
 def _format(role, user):
@@ -312,6 +380,7 @@ class Roles:
         self.model = self.config['model_name']
         self.identity = self.config['model_fingerprint']
         self.context = int(self.config['context_tokens'])
+        self.shared_evolution_memory = ()
         self.seed = int(self.config.get('seed', 42))
         self.transport = transport
         self._job = None
@@ -376,13 +445,29 @@ class Roles:
                    policy_hash=policy_hash, public_hash=public_hash))
         else:
             result = json.loads(path.read_text())
-        return decode_role_response(result, self.model), public_hash
+        try:
+            decoded = decode_role_response(result, self.model)
+            if role in ('review', 'diagnose'):
+                decoded = _review_findings(decoded, user['evidence'])
+        except ContractError as exc:
+            if role not in ('review', 'diagnose'):
+                raise
+            receipt = dict(request_key=key, response_hash=digest(result),
+                           output_hash=digest(result['choices'][0]['message'].get('content')),
+                           displayed_evidence_hash=_displayed_hash(user))
+            raise ReviewOutputError(str(exc), draft=receipt) from exc
+        return decoded, public_hash
 
-    def _review(self, role, evidence):
+    def _review(self, role, evidence, correction=None):
         system = DIAGNOSE + '\n' + REVIEW_RUBRIC.partition('\nVerdicts:')[0]
         evidence = deepcopy(evidence)
         witnesses = _review_witness_index(evidence)
         body = {'evidence': evidence}
+        limit = self.context - ROLE_SETTINGS[role][1]
+        # Meta feedback can be corrected once against the identical displayed
+        # evidence. Reserve the bounded correction receipt on both attempts.
+        if 'meta.retained' in evidence:
+            limit -= 1024
         if witnesses:
             items = list(witnesses.items())
             def show(count):
@@ -390,7 +475,6 @@ class Roles:
                 body['omitted_witness_count'] = len(items) - count
 
             show(len(items))
-            limit = self.context - ROLE_SETTINGS[role][1]
             if self.tokens.chat_count(_messages(system, body)) > limit:
                 low, high = 0, len(items)
                 while low < high:
@@ -401,17 +485,16 @@ class Roles:
                     else:
                         high = count - 1
                 show(low)
+        if self.tokens.chat_count(_messages(system, body)) > limit:
+            raise ValueError('Mandatory Reviewer evidence exceeds the registered context')
+        evidence_hash = _displayed_hash(body)
+        if correction is not None:
+            receipt = correction['previous_response']
+            if receipt['displayed_evidence_hash'] != evidence_hash:
+                raise ValueError('A format correction must use the original displayed Reviewer evidence')
+            body['format_correction'] = correction
         response, _ = self._call(role, system, body, self.seed)
-        findings = response.get('findings')
-        if not isinstance(findings, list) or not 1 <= len(findings) <= 8:
-            raise ContractError('Reviewer must return one to eight findings')
-        reviewed = []
-        for finding in findings:
-            if (not isinstance(finding, dict) or set(finding) != {'evidence_ids', 'judgment', 'observation'}
-                    or finding['judgment'] not in FINDING_KINDS or not _text(finding['observation'])):
-                raise ContractError('Reviewer finding lacks a bound judgment, observation or evidence citation')
-            reviewed.append({**finding, 'evidence_ids': _evidence_ids(finding['evidence_ids'], evidence)})
-        return dict(findings=reviewed, evidence_hash=digest(body if witnesses else evidence))
+        return dict(findings=response['findings'], evidence_hash=evidence_hash)
 
     def diagnose(self, mechanism, memory, ledger, history):
         program_hash = Program(mechanism).hash
@@ -424,44 +507,108 @@ class Roles:
         return self._review('diagnose', evidence)
 
     def review(self, mechanism, records):
+        return self._review_records(mechanism, records)
+
+    def review_retry(self, mechanism, records, prior_error):
+        if 'retained' not in records or not isinstance(prior_error, dict) or set(prior_error) != {'error', 'previous_response'}:
+            raise ValueError('A format correction requires sealed meta records and a previous Reviewer error')
+        receipt = prior_error['previous_response']
+        if (not _text(prior_error['error']) or not isinstance(receipt, dict)
+                or set(receipt) != {'request_key', 'response_hash', 'output_hash', 'displayed_evidence_hash'}
+                or any(not isinstance(v, str) or len(v) != 64 or any(c not in '0123456789abcdef' for c in v)
+                       for v in receipt.values())):
+            raise ValueError('Incomplete previous Reviewer response binding')
+        path = self.root / 'requests' / receipt['request_key'] / 'response.json'
+        previous = json.loads(path.read_text())
+        intent_path = next(iter(sorted(path.parent.glob('intent*.json'))), None)
+        if intent_path is None:
+            raise ValueError('Missing original Reviewer request')
+        intent = json.loads(intent_path.read_text())
+        original = json.loads(intent['request']['messages'][-1]['content'])
+        if (intent['role'] != 'review' or 'format_correction' in original
+                or 'meta.retained' not in original.get('evidence', {})
+                or _displayed_hash(original) != receipt['displayed_evidence_hash']
+                or digest(previous) != receipt['response_hash']
+                or digest(previous['choices'][0]['message'].get('content')) != receipt['output_hash']):
+            raise ValueError('Recorded Reviewer request or response differs from the correction receipt')
+        try:
+            _review_findings(decode_role_response(previous, self.model), original['evidence'])
+        except ContractError as exc:
+            if str(exc) != prior_error['error']:
+                raise ValueError('Previous Reviewer error differs from its actual response') from exc
+        else:
+            raise ValueError('Only an invalid Reviewer output is eligible for format correction')
+        return self._review_records(mechanism, records, correction=prior_error)
+
+    def _review_records(self, mechanism, records, correction=None):
         evidence = {'parent.source': mechanism}
         group = 'meta' if 'retained' in records else 'primary'
         evidence.update({f'{group}.{key}': _score_view(record) for key, record in records.items()})
-        return self._review('review', evidence)
+        return self._review('review', evidence, correction)
+
+    def evolution_memory(self, history):
+        """Export the v2 modification records, including failed and unscored drafts."""
+        return _compact_experiences(history, self.tokens)
 
     def compress(self, packet):
         """Freeze one public view. If required facts cannot fit, fail closed."""
         packet = json.loads(dumps(packet))
         if packet.get('phase') == 'primary':
             packet['recent_learning'] = [_visible_row(row) for row in packet.get('recent_learning', [])]
-            packet['history'] = self._history(_compact_experiences(packet.get('history', []), self.tokens),
-                                              packet.get('diagnosis'))
+            records = [*self.shared_evolution_memory, *self.evolution_memory(packet.get('history', []))]
+            packet['history'] = self._history(records, packet.get('diagnosis'))
         if isinstance(packet.get('primary'), dict):
             packet['primary'] = {k: _score_view(v) for k, v in packet['primary'].items()}
         # Same limit for both Evolvers, independent of policy or slot. First
         # retain all per-task outcomes and submitted sources, then reduce only
         # detailed episode witnesses if necessary, with explicit references.
         limit = int(self.config.get('public_token_limit', min(32768, max(512, self.context // 2))))
-        if self.tokens.count(dumps(packet)) > limit:
-            clipped = []
-            def compact(value):
-                if isinstance(value, list):
-                    for child in value:
-                        compact(child)
-                elif isinstance(value, dict):
-                    if 'evidence' in value and 'task_id' in value and isinstance(value['evidence'], dict):
-                        evidence = value['evidence']
-                        counts = {k: evidence[k] for k in ('events', 'steps', 'model_calls',
-                                  'stored_tokens_before', 'stored_tokens_after', 'exposed_memory_changes')
-                                  if isinstance(evidence.get(k), (int, float))}
-                        if evidence != counts:
-                            clipped.append(digest(evidence))
-                            value['evidence'] = counts
-                            value['full_witness_hash'] = digest(evidence)
-                    for child in value.values():
-                        compact(child)
-            compact(packet)
-            packet['omission'] = {'episode_witnesses_reduced': len(clipped), 'witnesses_hash': digest(clipped)}
+        if self.tokens.count(dumps(packet)) <= limit:
+            return packet
+
+        # Keep repeated code and episode evidence readable at one stable JSON
+        # pointer. Every candidate retains its own ordered outcomes and archive IDs.
+        rows = list(_public_rows(packet))
+        sources, witnesses = {}, {}
+        primary = packet.get('primary', {})
+        for slot, record in primary.items():
+            source = record.get('source')
+            if isinstance(source, str):
+                if source in sources:
+                    record['source_ref'] = sources[source]
+                    del record['source']
+                else:
+                    sources[source] = f'/primary/{slot}/source'
+        for path, row in rows:
+            facts = row.get('evidence')
+            if isinstance(facts, dict) and facts:
+                ref = digest(facts)
+                # Pre-search learning rows are later embedded under /pre. Never
+                # create an absolute pointer in a packet that will move.
+                if ref in witnesses and path.startswith('/primary/'):
+                    row['evidence_ref'] = witnesses[ref]
+                    del row['evidence']
+                else:
+                    witnesses[ref] = path + '/evidence'
+        if self.tokens.count(dumps(packet)) <= limit:
+            return packet
+
+        # The episode hash on each native row already locates the archived
+        # evidence. Keep the reduced payload and a digest of all omitted facts.
+        reduced = []
+        for path, row in rows:
+            facts = row.get('evidence')
+            if not isinstance(facts, dict):
+                continue
+            counts = _evidence_counts(facts)
+            if counts != facts:
+                fingerprint = digest(facts)
+                reduced.append([path, fingerprint])
+                row['evidence'] = counts
+                if not row.get('episode_hash'):
+                    row['full_witness_hash'] = fingerprint
+        if reduced:
+            packet['omission'] = {'episode_witnesses_reduced': len(reduced), 'witnesses_hash': digest(reduced)}
         if self.tokens.count(dumps(packet)) > limit:
             raise ValueError('Mandatory public evidence exceeds registered joint token limit')
         return packet

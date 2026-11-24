@@ -1,5 +1,9 @@
 # 在本地运行 EvoMemory 双分支搜索
 
+正式实验请从本版本工作树运行 `python -m rsi_paired campaign`。先完整运行 ALFWorld 的 `simple`，再运行 `two`。每类六轮，每轮学习 30 道新题，两组验证各登记 30 道，第六轮提交后进行独立的双臂百题终测。切换类型时只传递紧凑的 Evolution Memory。题库构成、分层抽样和启动命令见[正式运行说明](rsi_formal_alfworld.md)。以下六题流程供工程验收使用。
+
+同一轮常规验证与元验证的底层游戏组互斥。候选在个别验证题上发生可归责的 Hook 错误时，该题选拔分记 0、原生分记空，候选继续完成面板。每批只做一次 Evolver 自修改决策。元比较得分完整后，最后的 Reviewer 若格式或引用有误，可用相同证据纠正一次；再次无效则记录意见缺失，按已经核验的成绩选胜者。发生网络或服务中断时按原始收据恢复。
+
 这个版本的入口是 `python -m rsi_paired`。一次工程验收用六个不同的 ALFWorld 训练实例，学习、初选和双分支比较各两题。初选产生三个候选。若触发 Evolver 策略修改，旧策略与新策略都回到**初选三个候选生成之前**的机制与学习记忆，各自重新生成三个候选。双方看到同一份已封存的初选证据，按相同任务顺序和配对种子评分。每个候选槽位最多有三次评分前的语法或接口返修机会。两组各自的最优方案都可以选择母体或初选赢家。新组最优多解出至少一道题，才采纳新的提案策略。
 
 ## 1. 安装并检查入口
@@ -7,7 +11,7 @@
 需要 Linux、Python 3.10 或 3.11、Git 和系统库 libseccomp。在 Debian/Ubuntu 上库名为 `libseccomp2`。开发分支包含本次入口，请在克隆后的仓库根目录执行后面的命令。
 
 ```bash
-git clone --branch rsi-original-parent-paired-v2 https://github.com/mingbo-yang/EvoMemory.git
+git clone --branch rsi-original-parent-paired-v3 https://github.com/mingbo-yang/EvoMemory.git
 cd EvoMemory
 python3.10 -m venv .venv
 source .venv/bin/activate
@@ -21,7 +25,7 @@ python -m rsi_paired --help
 
 ```bash
 python -m scripts.prepare_assets alfworld
-python -m rsi_paired prepare-smoke \
+python -m rsi_paired prepare-smoke --v3 \
   --games data/downloads/alfworld-tw-0.4.2.zip \
   --metadata data/downloads/json_2.1.1_json.zip \
   --seed 42 --out runs/panel.json

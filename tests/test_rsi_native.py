@@ -11,6 +11,9 @@ from evomem.common import file_hash
 from phase1_codegen.hooks import HookSession
 from phase1_codegen.program import Program
 from rsi_paired.native import BASELINE_SOURCE, Native, _archive_episode, _evidence, _prefix, _wire
+from rsi_paired.panel import SEQUENTIAL_PROTOCOL
+from rsi_paired.workflow import LearningMechanismError, PROTOCOL, _Journal
+from phase1_codegen.policy import Rejected
 
 
 class Tokens:
@@ -121,6 +124,55 @@ class NativeMemoryTests(unittest.TestCase):
         self.assertEqual([(x[0], x[2]) for x in calls], [(8, 40), (9, 42)])
         self.assertEqual(calls[0][1], calls[1][1])
         self.assertEqual(initial['cool']['value'], 8)
+
+    def test_deployed_learning_hook_has_a_durable_unscored_failure_without_retry(self):
+        # The environment shell is a fixture. HookSession executes the bad
+        # deployed source in the real isolated worker and produces the rejection.
+        task = dict(id='fixture', family='cool', environment='alfworld', seed=7,
+                    archive_member='json_2.1.1/train/group/trial/game.tw-pddl')
+        source = 'def on_event(state, event, context):\n    return state["absent"]\n'
+        attempts = []
+        def run(task, bank, phase, seed, allow_write):
+            attempts.append(phase)
+            hook = HookSession(bank, task, allow_write)
+            with self.assertRaises(Rejected) as rejected:
+                hook.emit('task_start', {'visible': {}, 'step': 0})
+            ep = dict(task_id=task['id'], environment='alfworld', family='cool', seed=seed, environment_seed=7,
+                      phase=phase, program_hash=bank.program.hash, memory_hash_before=bank.fingerprint,
+                      memory_hash_after=bank.fingerprint, memory_hook=hook.summary(), actor_ledger_start=0,
+                      actor_ledger_end=0, score=None, error=str(rejected.exception), generated_memory_write_calls=0,
+                      executor='ALMA.Agent_Workflow.run_single_task', synthetic=False, native_reward_verified=False,
+                      history=[], native_recorder={'steps': []})
+            self.native.engine.runner.ledger.with_name('canonical_episodes.jsonl').write_text(json.dumps(ep) + '\n')
+            return ep
+        self.native.engine.runner = SimpleNamespace(episode=run)
+        self.native.protocol = SEQUENTIAL_PROTOCOL
+        journal = _Journal(self.native.root / 'batch', self.native, 2)
+        for _ in range(2):
+            with self.assertRaises(LearningMechanismError) as failure:
+                journal.job('learning/000', task, lambda: self.native.learn(source, {}, task, 11))
+        self.assertEqual(attempts, ['learning'])
+        # If the process died before journaling the error, native recovery also
+        # returns the same attested failure, without another environment execution.
+        with self.assertRaises(LearningMechanismError) as recovered:
+            self.native.learn(source, {}, task, 11)
+        self.assertEqual(recovered.exception.evidence, failure.exception.evidence)
+        self.assertEqual(attempts, ['learning'])
+        directory, = (self.native.root / 'episodes').iterdir()
+        result = json.loads((directory / 'learning_failure.json').read_text())['result']
+        self.assertIsNone(result['row']['score'])
+        self.assertIsNone(result['row']['native_score'])
+        self.assertTrue((directory / 'attempt-0/episode.json').is_file())
+        self.assertTrue((directory / 'attempt-0/actor.jsonl').is_file())
+        self.assertFalse((directory / 'attempt-0/infrastructure.json').exists())
+        self.assertFalse((directory / 'complete.json').exists())
+        self.assertFalse((self.native.root / 'learning').exists())
+        # The archived protocol keeps its original treatment of a learning error.
+        self.native.protocol = PROTOCOL
+        self.native.set_job(self.native.root / 'legacy/private')
+        with self.assertRaisesRegex(RuntimeError, 'Native task incomplete'):
+            self.native.learn(source, {}, task, 11)
+        self.assertEqual(attempts, ['learning', 'learning'])
 
     def test_witness_requires_real_delivery_and_tracks_emptying_memory(self):
         bank = {'state_wire': '{}', 'stored_tokens': 1}
