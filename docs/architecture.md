@@ -1,12 +1,12 @@
 # Architecture and code map
 
-The current layout separates role implementations, orchestration, reports,
-benchmark adapters, and tests. This is a structural refactor; the model-facing
-prompts, event contract, scoring, resource budgets, and adoption policy are
-unchanged. The original development checkout and experiment archives are not edited.
+The shared packages separate role implementations, orchestration, reporting,
+benchmark adapters and tests. The paired protocol adds a separately versioned
+proposal policy and a batch scheduler alongside the existing workflows.
 
 ```text
 EvoMemory/
+├── rsi_paired/                     # Original-parent paired policy search and receipt audit
 ├── evomem/                         # Common infrastructure and ALMA/model transport
 ├── phase1_codegen/                 # Memory-program evolution engine
 │   ├── roles/
@@ -67,8 +67,8 @@ Use a new run directory when bindings change; historical runs keep their frozen 
 
 ## Documentation and tests
 
-- [Online protocol](online_protocol.md) and [ALMA campaign](alma_campaign.md)
-  are the sole detailed workflow documents. Package-local duplicate READMEs were removed.
+- Workflow guides cover the [online protocol](online_protocol.md),
+  [ALMA campaign](alma_campaign.md) and [paired search](rsi_paired.md).
 - `python -m pytest -q` runs the bounded release suite.
 - Run specific research contracts explicitly, for example
   `python -m pytest tests/core/test_review_contract.py tests/online/test_search.py`.

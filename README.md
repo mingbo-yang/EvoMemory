@@ -2,20 +2,25 @@
 
 **Evolving agent memory mechanisms with structured experience from earlier mechanism changes.**
 
-EvoMemory is a research implementation of memory-program evolution. A fixed
-Executor solves tasks, a fixed Reviewer diagnoses and evaluates measured
-behavior, and a fixed Evolver edits the Task Memory program. A second store,
-Evolution Memory, retains evidence about earlier mechanism edits to inform
-later proposals. The Evolver, Reviewer, and Evolution Memory algorithm do not
-evolve themselves.
+EvoMemory evolves the program that supplies memory to a fixed Executor. A
+fixed Reviewer diagnoses observed behavior. Evolution Memory stores evidence
+from earlier edits for subsequent proposals.
 
-This release contains the current development implementation, including the
-`online-same-question-v2` task stream and `code-memory-hooks-v9` ALMA campaigns.
-It is **not a claim of a demonstrated effectiveness gain**. Engineering tests,
-native task outcomes, reviewer decisions, and transfer evidence are distinct.
-Historical experiment outputs and private judging data are not distributed.
+| Workflow | Entry point | What can change |
+|---|---|---|
+| Online task stream | `python -m math_apps_online` | The Task Memory program, with feedback on the same task |
+| ALMA campaign | `python -m phase1_codegen` | The Task Memory program across a registered campaign |
+| [Paired proposal-policy search](docs/rsi_paired.md) | `python -m rsi_paired` | The Task Memory program and the Evolver's proposal policy |
 
-## How it works
+For the paired-search development version, check out `rsi-original-parent-paired-v2`
+and run `python -m rsi_paired`. Both proposal policies generate fresh mechanisms
+from the same starting program, learning state and external evidence.
+See the [English run guide](docs/rsi_paired.md) or the
+[中文运行说明](docs/rsi_quickstart_zh.md) for the six-task native smoke test.
+The [formal ALFWorld guide](docs/rsi_formal_alfworld.md) covers the 240-task
+campaign, checkpoint recovery and frozen evaluation.
+
+## Task Memory evolution
 
 ```mermaid
 flowchart LR
@@ -50,7 +55,7 @@ Use **Linux and Python 3.10 or 3.11**. The isolation layer requires `libseccomp`
 there is no unrestricted execution fallback.
 
 ```bash
-git clone https://github.com/mingbo-yang/EvoMemory.git
+git clone --branch rsi-original-parent-paired-v2 https://github.com/mingbo-yang/EvoMemory.git
 cd EvoMemory
 python3.10 -m venv .venv
 source .venv/bin/activate
@@ -134,6 +139,7 @@ See [online protocol](docs/online_protocol.md),
 | `phase1_codegen/roles/` | Fixed Reviewer and Evolver implementations |
 | `phase1_codegen/reporting/` | Offline experiment reports |
 | `phase1_codegen/` | Event contract, memory execution, evidence, orchestration, adoption |
+| `rsi_paired/` | Paired proposal-policy search, native smoke run and receipt audit |
 | `math_apps_online/` | Transactional online task-stream scheduling and reporting |
 | `evomem/` | ALMA/model transport and common infrastructure |
 | `benchmarks/` | Pinned MATH/APPS and CrossEp-Emb adapters and host-side judging |
@@ -154,7 +160,7 @@ python -m build
 
 Native integration tests require separately prepared assets and are skipped
 when these assets are absent. Unit tests and fake transports are not research
-results. This packaging release does not run paid inference or a new experiment.
+results. The paired branch documents its native engineering validation separately.
 See [release scope](docs/release_scope.md) for portability edits and validation.
 
 ## License and upstream projects

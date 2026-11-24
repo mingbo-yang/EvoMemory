@@ -255,7 +255,10 @@ def isolate_stage(root):
     stage = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(stage)
     stage.AUDIT = Path(root).resolve() / 'alma_audit'
-    stage.META = OLD / 'alma_audit/downloads/json_2.1.1_json.zip'
+    # Public asset preparation places metadata next to the games archive.
+    # Existing frozen installations may only have the original audit download.
+    if not stage.META.is_file():
+        stage.META = OLD / 'alma_audit/downloads/json_2.1.1_json.zip'
     return stage
 
 
