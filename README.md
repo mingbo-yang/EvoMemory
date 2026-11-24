@@ -17,6 +17,8 @@ and run `python -m rsi_paired`. Both proposal policies generate fresh mechanisms
 from the same starting program, learning state and external evidence.
 See the [English run guide](docs/rsi_paired.md) or the
 [中文运行说明](docs/rsi_quickstart_zh.md) for the six-task native smoke test.
+The [formal ALFWorld guide](docs/rsi_formal_alfworld.md) covers the 240-task
+campaign, checkpoint recovery and frozen evaluation.
 
 ## Task Memory evolution
 

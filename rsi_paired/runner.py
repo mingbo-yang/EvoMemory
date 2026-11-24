@@ -1,6 +1,6 @@
 """Run one engineering batch on an already resident model service."""
 import os
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 
 import httpx
@@ -31,6 +31,10 @@ class SmokeAdapter(Roles):
     def learn(self, *args):
         return self.native.learn(*args)
 
+    def diagnose(self, mechanism, memory, ledger, history):
+        evidence = self.native.verified_learning_evidence(ledger)
+        return super().diagnose(mechanism, memory, evidence, history)
+
     def evaluate(self, *args):
         return self.native.evaluate(*args)
 
@@ -39,7 +43,6 @@ class SmokeAdapter(Roles):
 
 
 def run_smoke(root, cfg, manifest, exercise_pair=False):
-    from scripts.alma_feasibility import LEGACY, META
     if manifest.get("scope") != "engineering" or manifest.get("protocol") != "rsi_original_parent_paired_v2":
         raise ValueError("Expected a registered engineering panel")
     panels = manifest["panels"]
@@ -47,6 +50,21 @@ def run_smoke(root, cfg, manifest, exercise_pair=False):
         raise ValueError("The smoke entry point accepts two tasks per panel")
     if any(Path(t["archive_member"]).parts[1] != "train" for tasks in panels.values() for t in tasks):
         raise ValueError("Engineering smoke tasks must come from the training archive")
+    all_tasks = [task for tasks in panels.values() for task in tasks]
+    with open_stage(root, cfg, manifest, all_tasks, exercise_pair) as adapter:
+        state = initial_state()
+        return workflow.run_batch(root / "batch", state=state, panels=panels, adapter=adapter,
+                                  seed=manifest["seed"], force_pair=exercise_pair,
+                                  budget={"episodes": 26, "infrastructure_attempts": 2})
+
+
+def initial_state():
+    return dict(mechanism=BASELINE_SOURCE, evolver=INITIAL_STRATEGY, memory={}, ledger=[], history=[])
+
+
+@contextmanager
+def open_stage(root, cfg, manifest, tasks, exercise_pair=False, *, learning_archive=None):
+    from scripts.alma_feasibility import LEGACY, META
     if (file_hash(LEGACY / "downloads/alfworld-tw-0.4.2.zip") != manifest["games_sha256"]
             or file_hash(META) != manifest["metadata_sha256"]):
         raise ValueError("ALFWorld archive identity changed since panel preparation")
@@ -80,18 +98,14 @@ def run_smoke(root, cfg, manifest, exercise_pair=False):
     import json
     with ExitStack() as resources:
         caps = LocalModelCapabilities(root / 'capabilities', 'alfworld', root / 'capability_costs.jsonl',
-                                      tokenizer, model_hash, cfg['base_url'], phase='rsi_engineering')
+                                      tokenizer, model_hash, cfg['base_url'], phase='rsi_engineering' if manifest['scope'] == 'engineering' else 'rsi_formal')
         resources.callback(caps.close)
         cfg["model_catalog"] = caps.describe()
-        all_tasks = [task for tasks in panels.values() for task in tasks]
-        native = Native(root / 'native', all_tasks, tokenizer, model_hash, base_url=cfg["base_url"],
-                        model_name=cfg["model_name"], capabilities=caps)
+        native = Native(root / 'native', tasks, tokenizer, model_hash, base_url=cfg["base_url"],
+                        model_name=cfg["model_name"], capabilities=caps, learning_archive=learning_archive)
         resources.callback(native.close)
         dependencies.update(capability_fingerprint=caps.fingerprint, native_fingerprint=native.fingerprint)
         save_registration(root / "runtime.json", json.loads(workflow.canonical(dependencies)))
         adapter = SmokeAdapter(root, cfg, tokenizer, native, workflow.digest(dependencies))
         resources.callback(adapter.close)
-        state = dict(mechanism=BASELINE_SOURCE, evolver=INITIAL_STRATEGY, memory={}, ledger=[], history=[])
-        return workflow.run_batch(root / "batch", state=state, panels=panels, adapter=adapter,
-                                  seed=manifest["seed"], force_pair=exercise_pair,
-                                  budget={"episodes": 26, "infrastructure_attempts": 2})
+        yield adapter

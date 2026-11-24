@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from phase1_codegen.program import BASELINE_SOURCE
+from phase1_codegen.program import BASELINE_SOURCE, Program
 from rsi_paired.roles import (
     INITIAL_STRATEGY, MAX_EVIDENCE_REFERENCES, Roles, _compact_experiences, policy_instruction,
 )
@@ -99,6 +99,24 @@ def test_repeated_valid_review_citations_preserve_evidence_and_wire(tmp_path):
     receipt, = (r.root / 'requests').glob('*/response.json')
     raw = json.loads(receipt.read_text())['choices'][0]['message']['content']
     assert json.loads(raw) == response
+
+
+def test_pre_review_only_cites_learning_under_current_mechanism(tmp_path):
+    program_hash = Program(BASELINE_SOURCE).hash
+    ledger = [{'task_id': 'historical', 'program_hash': 'previous-source', 'score': 0},
+              {'task_id': 'unbound', 'score': 0},
+              {'task_id': 'current', 'program_hash': program_hash, 'score': 1}]
+    response = {'findings': [{'evidence_ids': ['learning.2'], 'judgment': 'no_defect_demonstrated',
+                              'observation': 'The current task succeeded.'}]}
+    r, calls = roles(tmp_path, response)
+    r.diagnose(BASELINE_SOURCE, {}, ledger, [])
+    evidence = json.loads(calls[0]['messages'][1]['content'])['evidence']
+    assert set(evidence) == {'parent.source', 'parent.memory', 'learning.2'}
+    assert evidence['learning.2']['program_hash'] == evidence['parent.memory']['program_hash'] == program_hash
+    response['findings'][0]['evidence_ids'] = ['learning.0']
+    r, _ = roles(tmp_path / 'invalid', response)
+    with pytest.raises(ContractError, match='displayed IDs'):
+        r.diagnose(BASELINE_SOURCE, {}, ledger, [])
 
 
 @pytest.mark.parametrize('citations', [[], ['parent.source', 'unavailable'], [None],
