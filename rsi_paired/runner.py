@@ -31,6 +31,10 @@ class SmokeAdapter(Roles):
     def learn(self, *args):
         return self.native.learn(*args)
 
+    def diagnose(self, mechanism, memory, ledger, history):
+        evidence = self.native.verified_learning_evidence(ledger)
+        return super().diagnose(mechanism, memory, evidence, history)
+
     def evaluate(self, *args):
         return self.native.evaluate(*args)
 

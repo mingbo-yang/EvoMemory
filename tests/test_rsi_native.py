@@ -65,7 +65,7 @@ class NativeMemoryTests(unittest.TestCase):
         session = HookSession(bank, task, allow_write=True)
         ep = dict(task_id=task_id, family=family, environment='alfworld', phase='learning',
                   native_reward_verified=True, score=0.0, error=None, goal='fixture observation',
-                  seed=42, done=False, history=[])
+                  seed=42, done=False, history=[], program_hash=Program(BASELINE_SOURCE).hash)
         session.emit('task_start', dict(step=0, visible={'obs': 'visible fixture'}))
         session.finish(ep)
         session.publish()
@@ -78,6 +78,13 @@ class NativeMemoryTests(unittest.TestCase):
         bank.source_log_hash = _prefix(bank.source_log_hash, identity)
         row = dict(task_id=task_id, family=family, score=0, phase='learning', episode_hash=identity)
         return bank.export_snapshot(), row
+
+    def test_learning_evidence_uses_program_from_verified_archive(self):
+        _, row = self.archive_learning('cool', 'cool/a')
+        claimed = dict(row, program_hash='wrong-source')
+        evidence, = self.native.verified_learning_evidence([claimed])
+        self.assertEqual(evidence, dict(row, program_hash=Program(BASELINE_SOURCE).hash))
+        self.assertEqual(claimed['program_hash'], 'wrong-source')
 
     def test_identical_source_reuses_and_changed_source_replays_same_family_prefix(self):
         ice, a = self.archive_learning('cool', 'cool/a')

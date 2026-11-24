@@ -162,6 +162,10 @@ class Native:
             raise ValueError('Ledger must reference verified learning episodes of this dataset')
         return ep
 
+    def verified_learning_evidence(self, ledger):
+        """Bind each learning row to the code that actually executed it."""
+        return [dict(row, program_hash=self._learning_episode(row)['program_hash']) for row in ledger]
+
     def prepare(self, mechanism, starting_mechanism, initial_memory, ledger):
         """Clone exact source or replay the same family-specific formal learning prefix."""
         old_program, program = Program(starting_mechanism), Program(mechanism)

@@ -342,10 +342,13 @@ class Roles:
         return dict(findings=reviewed, evidence_hash=digest(evidence))
 
     def diagnose(self, mechanism, memory, ledger, history):
+        program_hash = Program(mechanism).hash
         evidence = {'parent.source': mechanism, 'parent.memory': {
-            'snapshot_hash': digest(memory), 'known_types': sorted(memory) if isinstance(memory, dict) else []}}
+            'program_hash': program_hash, 'snapshot_hash': digest(memory),
+            'known_types': sorted(memory) if isinstance(memory, dict) else []}}
         for index, row in enumerate(ledger):
-            evidence[f'learning.{index}'] = _visible_row(row)
+            if row.get('program_hash') == program_hash:
+                evidence[f'learning.{index}'] = dict(_visible_row(row), program_hash=program_hash)
         return self._review('diagnose', evidence)
 
     def review(self, mechanism, records):
