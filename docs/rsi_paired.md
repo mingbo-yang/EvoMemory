@@ -29,6 +29,17 @@ Each proposal has an initial submission and up to three pre-scoring repairs for
 syntax or interface faults. Every attempt consumes its slot's resources. Invalid
 slots have no native score. A completed negative result stays in the record.
 Host failures are journaled and can resume within the registered attempt limit.
+Each repair uses the preceding submission and its exact error. A generation
+without a draft records `null`. Repair seeds are derived from the slot and
+draft index and remain matched between paired arms. Retrying an interrupted
+request retains the seed for that draft.
+
+The pre- and post-Reviewer receive the native task results and bounded excerpts
+linking a verified Actor memory delivery to an action and environment feedback.
+Episode receipts preserve the Hook output, the packed entries and the Actor
+request. Excerpt references and omission counts are recorded in the Reviewer
+request. A persistent readout can remain useful across steps. Attribution of a
+task outcome to memory requires evidence beyond delivery and the final score.
 
 ## Reproduce a small native run
 

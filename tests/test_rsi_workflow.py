@@ -125,6 +125,60 @@ class PairedWorkflowTests(unittest.TestCase):
         self.assertIsNone(json.loads((self.root/"meta_results.json").read_text())["O2"]["success_count"])
         self.assertEqual([x[1] for x in self.a.calls if x[0]=="N1"],[0])
 
+    def test_repair_seeds_match_across_paired_searches_and_survive_infrastructure_retry(self):
+        self.a.first_passes = {"O1": 3, "N1": 3}
+        propose = self.a.propose
+        interrupted = []
+
+        def interrupt_once(*args):
+            proposal = propose(*args)
+            slot, index = self.a.calls[-1][:2]
+            if slot == "O1" and index == 2 and not interrupted:
+                interrupted.append(index)
+                raise OSError("synthetic transport interruption")
+            return proposal
+
+        self.a.propose = interrupt_once
+        with self.assertRaisesRegex(InfrastructurePending, "synthetic transport interruption"):
+            self.execute()
+        self.execute()
+        old = json.loads((self.root / "slots/O1.json").read_text())
+        new = json.loads((self.root / "slots/N1.json").read_text())
+        seeds = [draft["seed"] for draft in old["drafts"]]
+        original = int(digest([42, "paired", 0])[:8], 16) % 2147483647
+        self.assertEqual(seeds[0], original)
+        self.assertEqual(len(set(seeds)), 4)
+        self.assertEqual(seeds, [draft["seed"] for draft in new["drafts"]])
+        self.assertEqual([call[5] for call in self.a.calls if call[0] == "O1"],
+                         [seeds[0], seeds[1], seeds[2], seeds[2], seeds[3]])
+        self.assertEqual([call[5] for call in self.a.calls if call[0] == "N1"], seeds)
+        self.assertEqual(json.loads((self.root / "registration.json").read_text())["repair_version"], 2)
+
+    def test_each_repair_receives_only_its_preceding_draft_and_exact_error(self):
+        for case, raw in enumerate((None, "", " \n", {"unexpected": True}, " {partial ")):
+            with self.subTest(raw=raw):
+                api = Synthetic()
+                api.triggers = False
+                api.first_passes = {"P1": 1}
+                propose = api.propose
+
+                def fail_second_generation(*args):
+                    proposal = propose(*args)
+                    if api.calls[-1][:2] == ("P1", 1):
+                        raise ContractError("no usable proposal", draft=raw)
+                    return proposal
+
+                api.propose = fail_second_generation
+                root = self.root / str(case)
+                run_batch(root, state=state(), panels=panels(), adapter=api)
+                slot = json.loads((root / "slots/P1.json").read_text())
+                expected = raw if isinstance(raw, str) and raw.strip() else None
+                self.assertEqual([(d["source"], d["error"]) for d in slot["drafts"]],
+                                 [("P1-bad", "Wrong Hook signature"), (expected, "no usable proposal"), ("P1", None)])
+                self.assertEqual([call[6:] for call in api.calls if call[0] == "P1"],
+                                 [(None, None), ("P1-bad", "Wrong Hook signature"), (expected, "no usable proposal")])
+                self.assertFalse((root / "jobs/checks/P1/1").exists())
+
     def test_tie_parent_fallback_and_deduplicated_score(self):
         self.a.scores.clear()
         value = self.execute()

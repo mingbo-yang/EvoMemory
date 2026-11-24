@@ -15,6 +15,7 @@ from tempfile import NamedTemporaryFile
 PROTOCOL = "rsi_original_parent_paired_v2"
 SLOTS = 3
 REPAIRS = 3
+REPAIR_VERSION = 2
 
 
 class ContractError(ValueError):
@@ -145,6 +146,11 @@ def _seed(seed, *parts):
     return int(digest([seed, *parts])[:8], 16) % 2147483647
 
 
+def _draft_seed(slot_seed, index):
+    """Keep first drafts unchanged and match repair draws across paired slots."""
+    return slot_seed if index == 0 else _seed(slot_seed, "repair", index)
+
+
 def _validate_panels(panels):
     if set(panels) != {"learning", "primary", "meta"}:
         raise ValueError("Expected exactly learning, primary and meta panels")
@@ -169,7 +175,7 @@ def _validate_score(row, task):
         raise ValueError("A complete native evaluation must bind the registered task and a binary score")
 
 
-def _public_episode(row):
+def _public_episode(row, *, for_review=False):
     # Never pass a private archive path, benchmark solution, engine metadata or hidden state.
     allowed = ("task_id", "family", "score", "done", "error", "steps", "visible_summary",
                "summary", "diagnosis", "candidate_error", "native_score", "status")
@@ -180,6 +186,8 @@ def _public_episode(row):
               "model_calls")
     if isinstance(row.get("evidence"), dict):
         result["evidence"] = {k: row["evidence"][k] for k in fields if k in row["evidence"]}
+        if for_review and "review_witness" in row["evidence"]:
+            result["evidence"]["review_witness"] = row["evidence"]["review_witness"]
     return result
 
 
@@ -199,11 +207,11 @@ def _experience(parent, label, row):
             "evaluation_key": row.get("eval_key")}
 
 
-def _public_record(record):
+def _public_record(record, *, for_review=False):
     allowed = ("source", "source_hash", "valid", "drafts", "error", "success_count", "evaluation")
     result = {k: record[k] for k in allowed if k in record}
     if "evaluation" in result:
-        result["evaluation"] = [_public_episode(row) for row in result["evaluation"]]
+        result["evaluation"] = [_public_episode(row, for_review=for_review) for row in result["evaluation"]]
     return result
 
 
@@ -237,7 +245,7 @@ class _Batch:
         self.ledger = deepcopy(state["ledger"])
         self.prepared = {}
         self.fingerprint = str(getattr(adapter, "fingerprint", type(adapter).__qualname__))
-        self.j.seal("registration", dict(protocol=PROTOCOL, state_hash=digest(state),
+        self.j.seal("registration", dict(protocol=PROTOCOL, repair_version=REPAIR_VERSION, state_hash=digest(state),
                     panel_hash=digest(panels), panels=panels, seed=seed, force_pair=force_pair,
                     budget=budget, adapter_fingerprint=self.fingerprint))
 
@@ -280,31 +288,35 @@ class _Batch:
         source = None
         loaded = None
         for n in range(REPAIRS + 1):
-            req = dict(**binding, draft=n, previous_hash=digest(previous), error=error)
+            seed = _draft_seed(slot_seed, n)
+            req = dict(**binding, draft=n, draft_seed=seed, previous_hash=digest(previous), error=error)
             def generate():
                 response = self.api.propose(deepcopy(evolver), self.original, deepcopy(packet),
-                                            slot_seed, previous, error)
+                                            seed, previous, error)
                 if (response.get("loaded_evolver_hash") != binding["requested_evolver_hash"]
                         or response.get("public_hash") != binding["proposal_context_hash"]):
                     raise ValueError("Model request used a different Evolver or public evidence")
-                if not isinstance(response.get("source"), str):
+                if not isinstance(response.get("source"), str) or not response["source"].strip():
                     raise ContractError("Candidate response did not contain source text")
                 return response
             try:
                 proposal = self.j.job(f"proposals/{name}/{n}", req, generate)
+            except ContractError as exc:
+                previous = exc.draft if isinstance(exc.draft, str) and exc.draft.strip() else None
+                error = str(exc)
+            else:
                 previous = proposal["source"]
                 loaded = proposal["loaded_evolver_hash"]
-                self.j.job(f"checks/{name}/{n}", [digest(previous), self.mother_hash],
-                           lambda: self.api.check(previous))
-            except ContractError as exc:
-                if exc.draft is not None:
-                    previous = exc.draft
-                error = str(exc)
-                drafts.append(dict(index=n, source=previous, error=error))
-                continue
-            drafts.append(dict(index=n, source=previous, error=None))
-            error, source = None, previous
-            break
+                try:
+                    self.j.job(f"checks/{name}/{n}", [digest(previous), self.mother_hash],
+                               lambda: self.api.check(previous))
+                    error = None
+                except ContractError as exc:
+                    error = str(exc)
+            drafts.append(dict(index=n, seed=seed, source=previous, error=error))
+            if error is None:
+                source = previous
+                break
         row = {**binding, "loaded_evolver_hash": loaded, "valid": source is not None, "source": source,
                "source_hash": digest(source) if source is not None else None, "drafts": drafts,
                "error": error}
@@ -348,7 +360,7 @@ class _Batch:
         self.j.seal(f"{panel_name}_results", records)
 
     def _review(self, phase, records):
-        published = {key: _public_record(row) for key, row in records.items()}
+        published = {key: _public_record(row, for_review=True) for key, row in records.items()}
         return self.j.job(f"reviews/{phase}", digest(published), lambda:
                           self.api.review(self.original, deepcopy(published)))
 

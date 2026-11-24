@@ -8,7 +8,7 @@ from phase1_codegen.program import BASELINE_SOURCE, Program
 from rsi_paired.roles import (
     INITIAL_STRATEGY, MAX_EVIDENCE_REFERENCES, Roles, _compact_experiences, policy_instruction,
 )
-from rsi_paired.workflow import ContractError, digest
+from rsi_paired.workflow import ContractError, _Batch, _public_record, digest
 
 
 class Tokens:
@@ -117,6 +117,53 @@ def test_pre_review_only_cites_learning_under_current_mechanism(tmp_path):
     r, _ = roles(tmp_path / 'invalid', response)
     with pytest.raises(ContractError, match='displayed IDs'):
         r.diagnose(BASELINE_SOURCE, {}, ledger, [])
+
+
+def test_verified_witness_reaches_pre_and_post_reviewer(tmp_path):
+    witness = {'transitions': [{'step': 9, 'feedback': 'synthetic verified feedback'}]}
+    row = {'task_id': 'test-task', 'episode_hash': 'archive', 'score': 0,
+           'program_hash': Program(BASELINE_SOURCE).hash,
+           'evidence': {'review_witness': witness, 'injected_readouts': ['obsolete prefix']}}
+    response = {'findings': [{'evidence_ids': ['learning.0'], 'judgment': 'insufficient_evidence',
+                              'observation': 'The recorded outcome leaves the cause unresolved.'}]}
+    r, calls = roles(tmp_path, response)
+    r.diagnose(BASELINE_SOURCE, {}, [row], [])
+    state = dict(mechanism=BASELINE_SOURCE, evolver=INITIAL_STRATEGY, memory={}, ledger=[], history=[])
+    batch = _Batch(tmp_path / 'batch', state, {}, r, 123, False, {})
+    record = {'valid': True, 'evaluation': [row], 'success_count': 0, 'source': BASELINE_SOURCE}
+    response['findings'][0]['evidence_ids'] = ['primary.P1']
+    review = batch._review('primary', {'parent': record, 'P1': record})
+    pre, post = [json.loads(c['messages'][1]['content']) for c in calls]
+    ref = digest(witness)
+    for body in (pre, post):
+        assert body['episode_witnesses'] == {ref: witness}
+        assert body['omitted_witness_count'] == 0
+        assert 'obsolete prefix' not in str(body)
+    assert pre['evidence']['learning.0']['evidence']['review_witness_ref'] == ref
+    for key in ('primary.parent', 'primary.P1'):
+        assert post['evidence'][key]['evaluation'][0]['evidence']['review_witness_ref'] == ref
+    assert review['evidence_hash'] == digest(post)
+    assert 'synthetic verified feedback' not in str(_public_record(record))
+    assert 'review_witness' in row['evidence']
+
+
+def test_review_context_omits_complete_witnesses_and_keeps_all_scores(tmp_path):
+    r, calls = roles(tmp_path, {'findings': [{'evidence_ids': ['primary.P1'],
+        'judgment': 'insufficient_evidence', 'observation': 'Some excerpts were omitted.'}]})
+    r.context = 6500
+    rows = [{'task_id': f'test-{i}', 'score': i % 2, 'episode_hash': f'archive-{i}',
+             'evidence': {'review_witness': {'transitions': [{'step': i, 'text': 'x' * 2400}]}}}
+            for i in range(8)]
+    r.review(BASELINE_SOURCE, {'P1': {'evaluation': rows}})
+    body = json.loads(calls[0]['messages'][1]['content'])
+    shown = body['episode_witnesses']
+    assert 0 < len(shown) < len(rows)
+    assert body['omitted_witness_count'] == len(rows) - len(shown)
+    for original, actual in zip(rows, body['evidence']['primary.P1']['evaluation'], strict=True):
+        ref = actual['evidence']['review_witness_ref']
+        assert actual['score'] == original['score'] and ref == digest(original['evidence']['review_witness'])
+        if ref in shown:
+            assert shown[ref] == original['evidence']['review_witness']
 
 
 @pytest.mark.parametrize('citations', [[], ['parent.source', 'unavailable'], [None],

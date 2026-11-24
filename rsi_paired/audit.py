@@ -8,7 +8,7 @@ from pathlib import Path
 
 from phase1_codegen.outcomes import candidate_hook_failure
 
-from .workflow import digest
+from .workflow import ContractError, REPAIR_VERSION, _draft_seed, _seed, digest
 
 
 def read(path):
@@ -212,36 +212,58 @@ class Audit:
             bank = self.bind_native("evaluation/"+key, index, task, seed, source_hash, panel, bank, row)
 
     def _slot_wire(self, label, index, expected, packet, original, previous, error):
+        from .roles import decode_role_response, proposal_source
+
         scope = f"batch/jobs/proposals/{label}/{index}/private"
         answer = []
-        # Scope is bound by the original request digest; no branch label is placed in model-visible input.
         for key, intents in self.intents.items():
             item = intents[0]
             if item["role"] != "propose":
                 continue
-            request = item["request"]
-            if key != digest(dict(role="propose", job=scope, model_fingerprint=item["model_fingerprint"],
-                                  policy_hash=item["policy_hash"], request=request)):
+            binding = dict(role="propose", job=scope, model_fingerprint=item["model_fingerprint"],
+                           policy_hash=item["policy_hash"], request=item["request"])
+            if digest(binding) != key:
                 continue
-            for item in intents:
-                actual = json.loads(item["request"]["messages"][-1]["content"])
-                self.check(digest(actual["public_evidence"]) == digest(packet) == item["public_hash"]
-                           and item["policy_hash"] == expected and actual["current_source"] == original
-                           and actual.get("own_draft") == previous and actual.get("own_contract_error") == error,
-                           f"Incorrect actual proposal input {label}/{index}")
-                receipt = self.root/"roles/requests"/key/"response.json"
-                source_hash = None
-                if receipt.exists():
-                    choice = read(receipt)["choices"][0]
-                    try:
-                        obj = json.loads(choice["message"]["content"])
-                    except (TypeError, ValueError):
-                        obj = None
-                    if choice.get("finish_reason") == "stop" and isinstance(obj, dict) and isinstance(obj.get("source"), str):
-                        source_hash = digest(obj["source"])
-                answer.append(dict(request_key=key, policy_hash=item["policy_hash"], public_hash=item["public_hash"],
-                                   response_source_hash=source_hash, seed=item["request"].get("seed")))
+            for send in intents:
+                self.check(all(send[k] == binding[k] for k in ("role", "model_fingerprint", "policy_hash", "request"))
+                           and send["public_hash"] == digest(packet),
+                           f"Retry changed actual proposal request {label}/{index}")
+            request = binding["request"]
+            body = json.loads(request["messages"][-1]["content"])
+            feedback = {k: body[k] for k in ("own_draft", "own_contract_error") if k in body}
+            self.check(digest(body["public_evidence"]) == digest(packet) and item["policy_hash"] == expected
+                       and body["current_source"] == original
+                       and feedback == ({} if index == 0 else dict(own_draft=previous, own_contract_error=error)),
+                       f"Incorrect actual proposal input {label}/{index}")
+            receipt = self.root / "roles/requests" / key / "response.json"
+            evidence = dict(request_key=key, policy_hash=item["policy_hash"], public_hash=item["public_hash"],
+                            seed=request.get("seed"), sends=len(intents), response_available=receipt.is_file())
+            if receipt.is_file():
+                # An identical retry shares a request key and one saved response. Never
+                # attribute that response or its generated draft to each physical send.
+                result = read(receipt)
+                raw = result["choices"][0]["message"].get("content")
+                evidence.update(response_raw_hash=digest(raw),
+                                response_attribution="request_key" if len(intents) > 1 else "single_send")
+                try:
+                    source = proposal_source(decode_role_response(result, request["model"]))
+                except ContractError as exc:
+                    evidence.update(response_error=str(exc), response_draft_hash=digest(exc.draft))
+                except RuntimeError as exc:
+                    self.check(False, f"Invalid proposal response {label}/{index}: {exc}")
+                else:
+                    evidence["response_source_hash"] = digest(source)
+            answer.append(evidence)
+        self.check(len(answer) <= 1, f"Multiple proposal request keys for {label}/{index}")
         return answer
+
+    def _job_binding(self, job, request):
+        key = digest(request)
+        rec = self.load(f"jobs/{job}/result.json")
+        if rec:
+            self.check(rec["request_hash"] == key, f"Wrong job inputs for {job}")
+            for path in (self.batch/"jobs"/job).glob("attempt-*.json"):
+                self.check(read(path)["request_hash"] == key, f"Wrong physical attempt inputs for {job}")
 
     def slot(self, name, packet, mother, old_hash, new_hash):
         row = self.load("slots/"+name+".json")
@@ -262,28 +284,73 @@ class Audit:
                    or (not row["valid"] and len(drafts) == 4 and bool(drafts[-1]["error"])
                        and row["source"] is None and row["source_hash"] is None), f"Invalid sealed slot: {name}")
         summary = {k: row[k] for k in (*expected,"seed","loaded_evolver_hash","valid","source_hash")}
+        registration = self.load("registration.json")
+        version = registration.get("repair_version", 1)
+        slot_seed = _seed(registration["seed"], "primary" if prefix == "P" else "paired", int(name[1:])-1)
+        self.check(type(row["seed"]) is int and row["seed"] == slot_seed, f"Wrong registered slot seed {name}")
+        binding = dict(**expected, seed=slot_seed)
         attempts, previous, error = [], None, None
         for d in drafts:
             i = d["index"]
-            generated = self.outcome(f"proposals/{name}/{i}")
-            checked = self.outcome(f"checks/{name}/{i}")
+            label = f"{name}/{i}"
+            generation_job, check_job = f"proposals/{label}", f"checks/{label}"
+            generated, checked = self.outcome(generation_job), self.outcome(check_job)
+            seed = _draft_seed(slot_seed, i) if version == REPAIR_VERSION else slot_seed
+            req = dict(**binding, draft=i, previous_hash=digest(previous), error=error)
+            if version == REPAIR_VERSION:
+                req["draft_seed"] = seed
+                self.check(type(d.get("seed")) is int and d["seed"] == seed, f"Wrong draft seed {label}")
+            else:
+                self.check("seed" not in d, f"Versioned draft in legacy registration {label}")
+            self._job_binding(generation_job, req)
             wire = self._slot_wire(name, i, policy, packet, mother["framework"], previous, error)
-            self.check(generated is not None, f"Missing proposal receipt {name}/{i}")
-            self.check(all(r["seed"] == row["seed"] for r in wire), f"Wrong model request seed {name}/{i}")
+            self.check(all(type(w["seed"]) is int and w["seed"] == seed for w in wire),
+                       f"Wrong model request seed {label}")
+            source = error = None
+            provenance = "generation_receipt_missing"
+            self.check(generated is not None, f"Missing proposal receipt {label}")
             if generated and generated["ok"]:
                 value = generated["value"]
-                self.check(value["source"] == d["source"] and value["loaded_evolver_hash"] == policy
-                           and value["public_hash"] == digest(packet) and checked is not None
-                           and checked["ok"] == (d["error"] is None), f"Unbound compiled draft {name}/{i}")
+                source = value["source"]
+                self._job_binding(check_job, [digest(source), digest(mother)])
+                self.check(isinstance(source, str) and value["loaded_evolver_hash"] == policy
+                           and value["public_hash"] == digest(packet) and checked is not None,
+                           f"Unbound compiled draft {label}")
+                if checked and not checked["ok"]:
+                    error = checked["error"]
+                    self.check(isinstance(error, str) and bool(error), f"Missing code check error {label}")
                 if self.real:
-                    self.check(bool(wire), f"Missing actual proposal request {name}/{i}")
-                    self.check(any(r["response_source_hash"] == digest(d["source"]) for r in wire),
-                               f"Draft not found in actual model response {name}/{i}")
+                    self.check(bool(wire), f"Missing actual proposal request {label}")
+                    self.check(any(w.get("response_source_hash") == digest(source) for w in wire),
+                               f"Draft not found in actual model response {label}")
+                provenance = "generated_source"
             elif generated is not None:
-                self.check(d["error"] == generated["error"] and not checked, f"Unbound failed proposal {name}/{i}")
-            attempts.append(dict(index=i, passed=d["error"] is None, source_hash=digest(d["source"]),
-                                 actual_requests=wire, error=d["error"]))
-            previous, error = d["source"], d["error"]
+                raw, error = generated.get("draft"), generated["error"]
+                self.check(isinstance(error, str) and bool(error), f"Missing generation error {label}")
+                source = raw if isinstance(raw, str) and raw.strip() else None
+                self.check(checked is None, f"Failed generation acquired a code check {label}")
+                if wire:
+                    self.check(any(w.get("response_error") == error and w.get("response_draft_hash") == digest(raw)
+                                   for w in wire), f"Generation failure differs from actual response {label}")
+                elif self.real and (raw is not None or str(error).startswith(("Role output incomplete", "Expected a JSON object",
+                                                                         "Expected only a complete source string"))):
+                    self.check(False, f"Missing actual proposal request {label}")
+                provenance = "generation_error_with_draft" if source is not None else "generation_error_without_draft"
+            self.check(error == d["error"], f"Wrong recorded draft error {label}")
+            recorded = source
+            if version == 1 and generated and not generated["ok"]:
+                recorded = previous if raw is None else raw
+                if raw is None and previous is not None:
+                    # Legacy replay reports the old handoff separately from the
+                    # actual source of this generation attempt (which is absent).
+                    provenance = "legacy_carried_previous_draft"
+                    self.report.setdefault("legacy_unbound_repairs", []).append(label)
+            self.check(d["source"] == recorded, f"Wrong recorded draft source {label}")
+            previous = recorded
+            attempts.append(dict(index=i, seed=seed, passed=error is None,
+                                 source_hash=None if source is None else digest(source),
+                                 provenance=provenance, actual_requests=wire, error=error))
+        self.check(row["error"] == error, f"Wrong terminal slot error {name}")
         if row["valid"]:
             self.check(row["loaded_evolver_hash"] == policy, f"Wrong loaded policy {name}")
         self.slots[name] = {**summary, "attempts": attempts}
@@ -379,6 +446,10 @@ class Audit:
         if not registration:
             self.report["stage"] = "awaiting_batch_registration"
             return
+        if "repair_version" in registration:
+            self.check(type(registration["repair_version"]) is int and registration["repair_version"] == REPAIR_VERSION,
+                       "Unsupported repair receipt version")
+        self.report["repair_version"] = registration.get("repair_version", 1)
         self.check(digest(registration["panels"]) == registration["panel_hash"], "Task panel hash mismatch")
         mother = self.load("parent_snapshot.json")
         starting = self.load("starting_state.json")
@@ -522,6 +593,8 @@ def audit_run(run_dir):
         audit.check(set(audit.native_rows) == audit.native_verified, "Native completions outside registered jobs")
         if audit.native_missing_wire:
             audit.report["status"] = "unverified_native_wire"
+    if audit.report.get("legacy_unbound_repairs") and audit.report["status"].startswith("verified"):
+        audit.report["status"] = "unverified_legacy_repair_attribution"
     if audit.errors:
         audit.report["status"] = "audit_failed"
     return audit.report

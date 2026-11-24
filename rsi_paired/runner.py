@@ -13,6 +13,7 @@ from phase1_codegen.tokenization import Tokenizer
 from . import native as native_module
 from . import roles as roles_module
 from . import workflow
+from . import witness
 from .native import BASELINE_SOURCE, Native
 from .panel import save_registration
 from .roles import INITIAL_STRATEGY, Roles
@@ -90,7 +91,7 @@ def open_stage(root, cfg, manifest, tasks, exercise_pair=False, *, learning_arch
                         panel_hash=workflow.digest(manifest), context_tokens=cfg["context_tokens"],
                         software={name: file_hash(path) for name, path in {
                             "roles": roles_module.__file__, "workflow": workflow.__file__,
-                            "native": native_module.__file__, "runner": __file__
+                            "native": native_module.__file__, "witness": witness.__file__, "runner": __file__
                         }.items()}, forced_engineering=exercise_pair,
                         model_config_hash=workflow.digest(cfg), role_limits=roles_module.ROLE_SETTINGS,
                         optional_models=os.environ.get("EVOMEMORY_ENABLE_OPTIONAL_MODELS", "1"))

@@ -43,9 +43,11 @@ exclude = ["tests*"]
 testpaths = [
   "tests/test_rsi_panel.py",
   "tests/test_rsi_audit.py",
+  "tests/test_rsi_repair_audit.py",
   "tests/test_rsi_workflow.py",
   "tests/test_rsi_roles.py",
   "tests/test_rsi_native.py",
+  "tests/test_rsi_native_witness.py",
   "tests/test_release.py",
   "tests/test_import_boundaries.py",
   "tests/core/test_local_service.py",

@@ -16,6 +16,7 @@ from phase1_codegen.native import NativeEvaluator
 from phase1_codegen.outcomes import candidate_hook_failure
 from phase1_codegen.policy import Rejected
 from phase1_codegen.program import BASELINE_SOURCE, Program, WorkerStartupError
+from . import witness
 from .workflow import _sync_directory, _write
 
 
@@ -56,7 +57,7 @@ def _prefix(previous, episode_hash):
     return digest([previous, episode_hash])
 
 
-def _evidence(ep, before, after, actors):
+def _evidence(ep, before, after, actors, *, episode_hash=None):
     hook = ep.get('memory_hook') or {}
     previous, changes, samples = {}, 0, []
     for item in hook.get('injections', []):
@@ -85,7 +86,8 @@ def _evidence(ep, before, after, actors):
                     stored_tokens_before=before['stored_tokens'], stored_tokens_after=after['stored_tokens'],
                     storage_sample_before=before['state_wire'][:240], storage_sample_after=after['state_wire'][:240],
                     exposed_memory_changes=changes, injected_readouts=samples,
-                    events=len(hook.get('events', [])), model_calls=cost['hook_model_calls'])
+                    events=len(hook.get('events', [])), model_calls=cost['hook_model_calls'],
+                    review_witness=witness.review_witness(ep, actors, episode_hash=episode_hash, bank=before))
     return evidence, cost
 
 
@@ -125,7 +127,8 @@ class Native:
                                       capabilities=capabilities, base_url=base_url, model_name=model_name)
         self.model_name = model_name
         self.model_fingerprint = model_fingerprint
-        self.fingerprint = digest(dict(adapter=file_hash(__file__), engine=self.engine.fingerprint))
+        self.fingerprint = digest(dict(adapter=file_hash(__file__), witness=file_hash(witness.__file__),
+                                       engine=self.engine.fingerprint))
         self.job = None
 
     def close(self):
@@ -303,7 +306,7 @@ class Native:
         if not failure:
             bank.source_log_hash = _prefix(bank.source_log_hash, ep_hash)
         snapshot = bank.export_snapshot()
-        evidence, cost = _evidence(ep, before, snapshot, actors)
+        evidence, cost = _evidence(ep, before, snapshot, actors, episode_hash=ep_hash)
         row = dict(task_id=task['id'], family=task['family'], phase=label, environment='alfworld',
                    episode_hash=ep_hash, native_score=ep['score'], score=0 if failure else int(ep['score']),
                    status='method_eval_failure' if failure else 'completed', error=ep.get('error'),

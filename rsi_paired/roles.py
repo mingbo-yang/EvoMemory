@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import ast
+from copy import deepcopy
 import json
 import io
 import tokenize
 import time
+from itertools import zip_longest
 from pathlib import Path
 
 from evomem.common import append, dumps, write
@@ -42,9 +44,18 @@ DIAGNOSE = """You are the fixed memory Reviewer. Assess only the displayed evide
 Return JSON exactly as {"findings":[{"evidence_ids":["..."],"judgment":"...",
 "observation":"..."}]}. Emit 1 to 8 findings. Judgment is supported_defect,
 no_defect_demonstrated or insufficient_evidence. Reference only IDs in the provided
-evidence object. Distinguish observed storage, actual delivery to the Actor and task
-outcomes. An empty initial memory, a default or a shorter readout alone does not
-establish benefit or failure. Provide an English assessment, without implementing
+evidence object. Distinguish the Hook's raw return, the host-bounded entries in the
+actual Actor request, and the excerpts available to you. Match review_witness_ref
+to episode_witnesses. Treat excerpt selection as a way to locate the original
+passage. A match in the raw return may have been removed during packing. A hash
+or an omitted excerpt is only a reference. For a claim
+about behavior, identify the task and cite a displayed action and its environment
+feedback with their step when available. State what those observations establish.
+Delivery followed by success or failure alone cannot establish that memory caused
+the outcome. Use insufficient_evidence when the available observations leave that
+attribution unresolved. A memory delivered unchanged across many steps can remain
+useful. An empty initial memory, a default, a short readout, or its change frequency
+alone does not establish benefit or failure. Provide an English assessment, without implementing
 a change, prescribing a mechanism, choosing an action, or deciding deployment."""
 DECIDE = """You are the Evolver's fixed self-revision decision procedure. Determine
 whether the evidence warrants revising your proposal strategy. Return JSON with
@@ -75,6 +86,28 @@ MAX_EVIDENCE_REFERENCES = 32
 
 def _text(value, *, empty=False):
     return isinstance(value, str) and (empty or bool(value.strip()))
+
+
+def decode_role_response(result, model):
+    if result.get('model') != model:
+        raise RuntimeError('Model response identity differs from the registered role model')
+    choice = result['choices'][0]
+    raw = choice['message'].get('content')
+    if choice.get('finish_reason') != 'stop' or not isinstance(raw, str):
+        raise ContractError('Role output incomplete; finish_reason=' + str(choice.get('finish_reason')), draft=raw)
+    try:
+        value = json.loads(raw)
+    except ValueError as exc:
+        raise ContractError('Expected a JSON object: ' + str(exc), draft=raw) from exc
+    if not isinstance(value, dict):
+        raise ContractError('Expected a JSON object', draft=raw)
+    return value
+
+
+def proposal_source(response):
+    if set(response) != {'source'} or not _text(response.get('source')):
+        raise ContractError('Expected only a complete source string', draft=dumps(response))
+    return response['source']
 
 
 def _english_instruction(value, *, empty=False):
@@ -125,6 +158,40 @@ def _visible_row(row):
     """Use the native adapter's externally observed witnesses only."""
     return {k: row[k] for k in ('task_id', 'family', 'score', 'native_score', 'status',
                                 'phase', 'episode_hash', 'evidence') if k in row}
+
+
+def _review_witness_index(evidence):
+    """Bind excerpts to their episode rows and share identical receipts across candidate slots."""
+    witnesses = {}
+    groups = []
+    for item in evidence.values():
+        if not isinstance(item, dict):
+            continue
+        rows = [item] if 'task_id' in item else item.get('evaluation', [])
+        group = []
+        for row in rows:
+            facts = row.get('evidence', {})
+            if 'review_witness' not in facts:
+                continue
+            witness = facts.pop('review_witness')
+            facts.pop('injected_readouts', None)  # Superseded first-entry prefixes.
+            ref = digest(witness)
+            facts['review_witness_ref'] = ref
+            witnesses[ref] = witness
+            group.append(ref)
+        if group:
+            groups.append(group)
+    # If the full set exceeds context, retain whole witnesses across arms in task order.
+    order = dict.fromkeys(ref for batch in zip_longest(*groups) for ref in batch if ref is not None)
+    return {ref: witnesses[ref] for ref in order}
+
+
+def _messages(system, body):
+    try:
+        content = json.dumps(body, ensure_ascii=False, sort_keys=True, separators=(',', ':'), allow_nan=False)
+    except (ValueError, TypeError) as exc:
+        raise ValueError('Role evidence must consist of finite JSON values') from exc
+    return [{'role': 'system', 'content': system}, {'role': 'user', 'content': content}]
 
 
 def _score_view(record):
@@ -267,11 +334,7 @@ class Roles:
             self.client.client.close()
 
     def _call(self, role, system, user, seed, *, policy_hash=None):
-        try:
-            body_text = json.dumps(user, ensure_ascii=False, sort_keys=True, separators=(',', ':'), allow_nan=False)
-        except (ValueError, TypeError) as exc:
-            raise ValueError('Role evidence must consist of finite JSON values') from exc
-        messages = [{'role': 'system', 'content': system}, {'role': 'user', 'content': body_text}]
+        messages = _messages(system, user)
         temp, limit = ROLE_SETTINGS[role]
         n = self.tokens.chat_count(messages)
         if n + limit > self.context:
@@ -279,7 +342,7 @@ class Roles:
         request = dict(model=self.model, messages=messages, temperature=temp, top_p=1, max_tokens=limit,
                        seed=seed, response_format=_format(role, user),
                        chat_template_kwargs={'enable_thinking': False})
-        public = json.loads(body_text).get('public_evidence')
+        public = user.get('public_evidence')
         public_hash = digest(public) if public is not None else None
         key = digest(dict(role=role, job=self._job, model_fingerprint=self.identity, policy_hash=policy_hash, request=request))
         out = self.root / 'requests' / key
@@ -313,23 +376,32 @@ class Roles:
                    policy_hash=policy_hash, public_hash=public_hash))
         else:
             result = json.loads(path.read_text())
-        if result.get('model') != self.model:
-            raise RuntimeError('Model response identity differs from the registered role model')
-        choice = result['choices'][0]
-        raw = choice['message'].get('content')
-        if choice.get('finish_reason') != 'stop' or not isinstance(raw, str):
-            raise ContractError('Role output incomplete; finish_reason=' + str(choice.get('finish_reason')), draft=raw)
-        try:
-            value = json.loads(raw)
-        except ValueError as exc:
-            raise ContractError('Expected a JSON object: ' + str(exc), draft=raw) from exc
-        if not isinstance(value, dict):
-            raise ContractError('Expected a JSON object', draft=raw)
-        return value, public_hash
+        return decode_role_response(result, self.model), public_hash
 
     def _review(self, role, evidence):
-        response, _ = self._call(role, DIAGNOSE + '\n' + REVIEW_RUBRIC.partition('\nVerdicts:')[0],
-                                 {'evidence': evidence}, self.seed)
+        system = DIAGNOSE + '\n' + REVIEW_RUBRIC.partition('\nVerdicts:')[0]
+        evidence = deepcopy(evidence)
+        witnesses = _review_witness_index(evidence)
+        body = {'evidence': evidence}
+        if witnesses:
+            items = list(witnesses.items())
+            def show(count):
+                body['episode_witnesses'] = dict(items[:count])
+                body['omitted_witness_count'] = len(items) - count
+
+            show(len(items))
+            limit = self.context - ROLE_SETTINGS[role][1]
+            if self.tokens.chat_count(_messages(system, body)) > limit:
+                low, high = 0, len(items)
+                while low < high:
+                    count = (low + high + 1) // 2
+                    show(count)
+                    if self.tokens.chat_count(_messages(system, body)) <= limit:
+                        low = count
+                    else:
+                        high = count - 1
+                show(low)
+        response, _ = self._call(role, system, body, self.seed)
         findings = response.get('findings')
         if not isinstance(findings, list) or not 1 <= len(findings) <= 8:
             raise ContractError('Reviewer must return one to eight findings')
@@ -339,7 +411,7 @@ class Roles:
                     or finding['judgment'] not in FINDING_KINDS or not _text(finding['observation'])):
                 raise ContractError('Reviewer finding lacks a bound judgment, observation or evidence citation')
             reviewed.append({**finding, 'evidence_ids': _evidence_ids(finding['evidence_ids'], evidence)})
-        return dict(findings=reviewed, evidence_hash=digest(evidence))
+        return dict(findings=reviewed, evidence_hash=digest(body if witnesses else evidence))
 
     def diagnose(self, mechanism, memory, ledger, history):
         program_hash = Program(mechanism).hash
@@ -457,9 +529,7 @@ class Roles:
             user['own_contract_error'] = error
         loaded = digest(evolver)
         response, public = self._call('propose', system, user, seed, policy_hash=loaded)
-        if set(response) != {'source'} or not _text(response.get('source')):
-            raise ContractError('Expected only a complete source string', draft=dumps(response))
-        return dict(source=response['source'], loaded_evolver_hash=loaded, public_hash=public)
+        return dict(source=proposal_source(response), loaded_evolver_hash=loaded, public_hash=public)
 
     def check(self, source):
         """Static language/syntax, followed by the public ABI on a synthetic lifecycle.
