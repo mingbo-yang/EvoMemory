@@ -1,5 +1,11 @@
 """Run one engineering batch on an already resident model service."""
+from copy import deepcopy
+import multiprocessing
 import os
+from concurrent.futures import ProcessPoolExecutor
+from multiprocessing.util import Finalize
+from tempfile import TemporaryDirectory
+from threading import Thread
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
 
@@ -13,10 +19,46 @@ from phase1_codegen.tokenization import Tokenizer
 from . import native as native_module
 from . import roles as roles_module
 from . import workflow
+from . import coevolution_roles, coevolution_workflow
 from . import witness
 from .native import BASELINE_SOURCE, Native
-from .panel import SEQUENTIAL_PROTOCOL, save_registration
+from .panel import COEVOLUTION_MIXED_10X60_PROTOCOL, COEVOLUTION_PROTOCOLS, SEQUENTIAL_PROTOCOLS, save_registration
 from .roles import INITIAL_STRATEGY, Roles
+
+
+_worker_native = None
+
+
+def _exit_with_coordinator():
+    # A killed CLI cannot shut down its pool. Stop issuing further Actor requests.
+    multiprocessing.parent_process().join()
+    os._exit(1)
+
+
+def _start_candidate_worker(root, cfg, tasks, phase, protocol, expected_native):
+    """Construct an independent ALMA environment inside the spawned process."""
+    global _worker_native
+    Thread(target=_exit_with_coordinator, daemon=True).start()
+    with ExitStack() as resources:
+        layout = resources.enter_context(TemporaryDirectory(prefix="evomemory-candidate-"))
+        tokenizer = Tokenizer(cfg["tokenizer_path"], model_name=cfg["model_name"])
+        caps = LocalModelCapabilities(root / "capabilities", "alfworld", root / "capability_costs.jsonl",
+                                      tokenizer, cfg["model_fingerprint"], cfg["base_url"], phase=phase)
+        resources.callback(caps.close)
+        native = Native(root / "native", tasks, tokenizer, cfg["model_fingerprint"],
+                        base_url=cfg["base_url"], model_name=cfg["model_name"], capabilities=caps,
+                        protocol=protocol, runtime_root=layout)
+        resources.callback(native.close)
+        # The fingerprint covers the full task manifest, model and capability catalog.
+        if native.fingerprint != expected_native:
+            raise RuntimeError("Candidate worker differs from the registered native evaluator")
+        _worker_native = native
+        Finalize(None, resources.pop_all().close, exitpriority=10)
+
+
+def _evaluate_candidate(job_path, source, memory, tasks, seeds):
+    _worker_native.set_job(job_path)
+    return _worker_native.evaluate(source, memory, tasks, seeds)
 
 
 class SmokeAdapter(Roles):
@@ -24,6 +66,8 @@ class SmokeAdapter(Roles):
         super().__init__(root, cfg, tokenizer=tokenizer)
         self.native = native
         self.fingerprint = fingerprint
+        self.candidate_workers = cfg.get("candidate_workers", 1)
+        self.candidate_pool = None
 
     def set_job(self, path):
         super().set_job(path)
@@ -39,12 +83,19 @@ class SmokeAdapter(Roles):
     def evaluate(self, *args):
         return self.native.evaluate(*args)
 
+    def evaluate_isolated(self, job_path, source, memory, tasks, seeds):
+        return self.candidate_pool.submit(_evaluate_candidate, job_path, source, memory, tasks, seeds).result()
+
     def prepare(self, *args):
         return self.native.prepare(*args)
 
 
+class CoevolutionAdapter(coevolution_roles.CoevolutionRolesMixin, SmokeAdapter):
+    """Native evaluator with independently versioned diagnostic and proposal policies."""
+
+
 def run_smoke(root, cfg, manifest, exercise_pair=False):
-    if manifest.get("scope") != "engineering" or manifest.get("protocol") not in (workflow.PROTOCOL, SEQUENTIAL_PROTOCOL):
+    if manifest.get("scope") != "engineering" or manifest.get("protocol") not in (workflow.PROTOCOL, *SEQUENTIAL_PROTOCOLS):
         raise ValueError("Expected a registered engineering panel")
     panels = manifest["panels"]
     if set(panels) != {"learning", "primary", "meta"} or any(len(rows) != 2 for rows in panels.values()):
@@ -59,12 +110,26 @@ def run_smoke(root, cfg, manifest, exercise_pair=False):
                                   budget={"episodes": 26, "infrastructure_attempts": 2})
 
 
-def initial_state():
-    return dict(mechanism=BASELINE_SOURCE, evolver=INITIAL_STRATEGY, memory={}, ledger=[], history=[])
+def initial_state(arm=None):
+    state = dict(mechanism=BASELINE_SOURCE, evolver=deepcopy(INITIAL_STRATEGY), memory={}, ledger=[], history=[])
+    if arm is not None:
+        if arm not in coevolution_workflow.ARM_COMPONENTS:
+            raise ValueError(f"Unknown co-evolution arm: {arm}")
+        state.update(arm=arm, reviewer=deepcopy(coevolution_roles.INITIAL_REVIEWER))
+    return state
 
 
 @contextmanager
-def open_stage(root, cfg, manifest, tasks, exercise_pair=False, *, learning_archive=None, shared_evolution_memory=()):
+def open_stage(root, cfg, manifest, tasks, exercise_pair=False, *, learning_archive=None, shared_evolution_memory=(), arm=None):
+    coevolving = manifest.get("protocol") in COEVOLUTION_PROTOCOLS
+    if coevolving != (arm is not None) or (coevolving and arm not in coevolution_workflow.ARM_COMPONENTS):
+        raise ValueError("The registered campaign protocol and experimental arm do not match")
+    if coevolving:
+        from .coevolution_panel import validate_coevolution_manifest
+        validate_coevolution_manifest(manifest)
+    workers = cfg.get("candidate_workers", 1)
+    if type(workers) is not int or workers < 1:
+        raise ValueError("candidate_workers must be a positive integer")
     from scripts.alma_feasibility import LEGACY, META
     if (file_hash(LEGACY / "downloads/alfworld-tw-0.4.2.zip") != manifest["games_sha256"]
             or file_hash(META) != manifest["metadata_sha256"]):
@@ -86,7 +151,7 @@ def open_stage(root, cfg, manifest, tasks, exercise_pair=False, *, learning_arch
         identity["max_model_len"] = row["max_model_len"]
     model_hash = workflow.digest(checkpoint)
     cfg = dict(cfg, model_fingerprint=model_hash, seed=manifest["seed"])
-    tokenizer = Tokenizer(cfg["tokenizer_path"])
+    tokenizer = Tokenizer(cfg["tokenizer_path"], model_name=cfg["model_name"])
     dependencies = dict(model_identity=identity, checkpoint_hash=model_hash,
                         panel_hash=workflow.digest(manifest), context_tokens=cfg["context_tokens"],
                         software={name: file_hash(path) for name, path in {
@@ -95,13 +160,19 @@ def open_stage(root, cfg, manifest, tasks, exercise_pair=False, *, learning_arch
                         }.items()}, forced_engineering=exercise_pair,
                         model_config_hash=workflow.digest(cfg), role_limits=roles_module.ROLE_SETTINGS,
                         optional_models=os.environ.get("EVOMEMORY_ENABLE_OPTIONAL_MODELS", "1"))
+    if coevolving:
+        dependencies["role_limits"] = CoevolutionAdapter.role_settings
+        dependencies["arm"] = arm
+        dependencies["software"].update(coevolution_roles=file_hash(coevolution_roles.__file__),
+                                        coevolution_workflow=file_hash(coevolution_workflow.__file__))
     if shared_evolution_memory:
         dependencies["shared_evolution_memory_hash"] = workflow.digest(shared_evolution_memory)
     # Store a JSON-normalized value so tuple-valued sampling settings compare on recovery.
     import json
     with ExitStack() as resources:
+        phase = 'rsi_engineering' if manifest['scope'] == 'engineering' else 'rsi_formal'
         caps = LocalModelCapabilities(root / 'capabilities', 'alfworld', root / 'capability_costs.jsonl',
-                                      tokenizer, model_hash, cfg['base_url'], phase='rsi_engineering' if manifest['scope'] == 'engineering' else 'rsi_formal')
+                                      tokenizer, model_hash, cfg['base_url'], phase=phase)
         resources.callback(caps.close)
         cfg["model_catalog"] = caps.describe()
         native = Native(root / 'native', tasks, tokenizer, model_hash, base_url=cfg["base_url"],
@@ -109,8 +180,37 @@ def open_stage(root, cfg, manifest, tasks, exercise_pair=False, *, learning_arch
                         protocol=manifest["protocol"])
         resources.callback(native.close)
         dependencies.update(capability_fingerprint=caps.fingerprint, native_fingerprint=native.fingerprint)
-        save_registration(root / "runtime.json", json.loads(workflow.canonical(dependencies)))
-        adapter = SmokeAdapter(root, cfg, tokenizer, native, workflow.digest(dependencies))
+        runtime = root / "runtime.json"
+        dependencies = json.loads(workflow.canonical(dependencies))
+        registered = dependencies
+        recovery = root / "evidence-recovery.json"
+        if recovery.is_file():
+            before = workflow._read(runtime)
+            binding = workflow._read(recovery)
+            changed = {"roles", "runner"}
+            if (manifest["protocol"] != COEVOLUTION_MIXED_10X60_PROTOCOL or arm != "D"
+                    or root.name != "evolution-01" or root.parent.name != arm
+                    or binding != {"previous_runtime_hash": workflow.digest(before),
+                                   "software": {k: dependencies["software"][k] for k in changed}}
+                    or before != dict(dependencies, software={
+                        k: before["software"][k] if k in changed else v
+                        for k, v in dependencies["software"].items()
+                    })):
+                raise ValueError("Evidence recovery changed the registered execution environment")
+            save_registration(root / "runtime-evidence-recovery.json", dependencies)
+            registered = before
+        save_registration(runtime, registered)
+        adapter_type = CoevolutionAdapter if coevolving else SmokeAdapter
+        adapter = adapter_type(root, cfg, tokenizer, native, workflow.digest(registered))
+        if coevolving:
+            adapter.arm = arm
+            adapter.protocol = manifest["protocol"]
+            adapter.registered_batches = tuple(workflow.digest(batch) for batch in manifest["batches"])
         adapter.shared_evolution_memory = tuple(shared_evolution_memory)
         resources.callback(adapter.close)
+        if workers > 1:
+            adapter.candidate_pool = resources.enter_context(ProcessPoolExecutor(
+                max_workers=workers, mp_context=multiprocessing.get_context("spawn"),
+                initializer=_start_candidate_worker,
+                initargs=(root, cfg, tasks, phase, manifest["protocol"], native.fingerprint)))
         yield adapter

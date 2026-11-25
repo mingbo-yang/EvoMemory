@@ -1,7 +1,4 @@
-"""ALMA's original Agent_Workflow with model-transport and memory adapters only.
-
-No custom action loop, prompt, planner, reflection or ALMA Meta Agent is used.
-"""
+"""ALMA's action loop with a current-action-list instruction and local model transport."""
 from __future__ import annotations
 import asyncio
 from contextvars import ContextVar
@@ -19,6 +16,27 @@ from .actor_transport import context_limit_response
 CONTEXT=ContextVar('phase1_alma_episode',default=None)
 ACTOR_PARAMETERS=dict(temperature=0,top_p=1,max_tokens=512,
                       chat_template_kwargs={'enable_thinking':False})
+ALFWORLD_ACTOR_PARAMETERS = {**ACTOR_PARAMETERS, 'stop': ['\n']}
+
+ALFWORLD_ACTION_POLICY = (
+    "Complete the household task described in the observations. "
+    "At each step, choose exactly one line from the <Actions> list in the latest observation. "
+    "Copy that line verbatim as your entire reply, including its verb and object numbers.\n"
+)
+
+
+def _alfworld_actor_prompt(get_prompt, upstream_policy):
+    """Keep ALMA's native observation, command list and rendered memory intact."""
+    async def render(*args, **kwargs):
+        messages = await get_prompt(*args, **kwargs)
+        system = messages[0]
+        if system['role'] != 'system' or not system['content'].startswith(upstream_policy):
+            raise ValueError('Unexpected ALFWorld system prompt')
+        memory_suffix = system['content'][len(upstream_policy):]
+        return [dict(system, content=ALFWORLD_ACTION_POLICY + memory_suffix), *messages[1:]]
+
+    return render
+
 
 def goal_from_initial(initial):
     if initial.get('goal'): return str(initial['goal'])
@@ -93,7 +111,7 @@ class ALMARunner:
                 if body.get('model')!=owner.llm.model_name: raise ValueError('unexpected actor model')
                 if 'response_format' in body: raise ValueError('ALMA actor must retain raw action output')
                 step=sum(m['role']=='user' for m in body['messages'])-1
-                body.update(ACTOR_PARAMETERS,seed=ctx['model_seed']+step)
+                body.update(ALFWORLD_ACTOR_PARAMETERS,seed=ctx['model_seed']+step)
                 rejected=context_limit_response(request,body,tokenizer=owner.tokenizer,
                     context=ctx,ledger=owner.ledger,model=owner.llm)
                 if rejected is not None: return rejected
@@ -138,6 +156,8 @@ class ALMARunner:
         self.NoMemory=module.SimilarityMemory
         self.workflow=Agent_Workflow([self.NoMemory()],self.llm.model_name,train_size=max(1,len(selected_tasks)),status='train',update_task='train')
         self.workflow.init_env('alfworld')
+        from eval_envs.prompts.env_prompt import ALFWORLD_BASIC_PROMPT
+        self.workflow.env.get_prompt = _alfworld_actor_prompt(self.workflow.env.get_prompt, ALFWORLD_BASIC_PROMPT)
         if self.workflow.env.max_trails!=30: raise ValueError('ALMA episode budget drift')
         upstream_clone=self.workflow.env._clone_env
         def seeded_clone():

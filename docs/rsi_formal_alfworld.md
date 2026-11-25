@@ -1,6 +1,6 @@
 # Sequential ALFWorld campaign
 
-The `rsi_original_parent_paired_v3_6x30` formal registration runs two native ALFWorld task families in order.
+New formal registrations use `rsi_original_parent_paired_v3_6x30_fresh` and run two native ALFWorld task families in order.
 The supplied seed-42 panel starts with `simple` (pick and place one object)
 and continues with `two` (pick two objects and place them). Each family has
 six evolution rounds and its own final test. The second family starts after
@@ -10,16 +10,12 @@ the first family's final completion receipt has been verified.
 
 1. Execute 30 previously unseen learning games once each, recording both successes
    and failures from the environment. The deployed mechanism updates its Task Memory.
-2. Seal two disjoint panels of 30 games. Each calls for six historical failures,
-   six historical successes and 18 fresh games. Historical status comes from the
-   original learning episode, including the current batch. An official game group
-   can contribute to only one panel within the round. The registered allocator
-   maximizes historical quota coverage, balances scarce outcomes across the two
-   panels and uses seeded ranks for selection. Fill shortfalls with the panel's
-   own preregistered fresh games. Several distinct trials in a group may appear
-   in the same panel.
-   Candidate scores, validation-only games and the other family's tasks are
-   ineligible for historical sampling. A historical game may recur in later rounds.
+2. Use the two distinct 30-game panels preregistered for this round. All 60 are
+   fresh game instances, selected before learning outcomes are known. The
+   primary panel evaluates memory mechanisms. The meta panel evaluates the
+   candidates proposed by the two Evolver policies when self-revision is
+   triggered. All candidates and controls scored on a given panel receive
+   the same ordered tasks and environment seeds.
 3. Freeze the original parent and learning memory. The Reviewer diagnoses evidence
    bound to the executed parent. Generate three primary candidates and evaluate
    eligible implementations and the parent on the first panel. Record each slot,
@@ -45,8 +41,9 @@ the first family's final completion receipt has been verified.
 5. Commit the selected mechanism, proposal policy and corresponding learning
    memory. Candidate evaluations use private copies. Each round records source
    differences, memory behavior where execution histories permit comparison,
-   and paired native outcomes by historical failure, historical success and
-   fresh game. These describe observed behavior and task reward.
+   and paired native outcomes. Every scored gate task in a fresh-only round
+   has the origin `fresh`. Historical learning trajectories remain available
+   for diagnosis and for rebuilding candidate memory.
 
 ## Final test and transfer
 
@@ -65,11 +62,19 @@ test outcomes stay outside that archive.
 ## Game identities and independence
 
 The registration uses official ALFWorld game files, unique across the
-manifest by archive member, content hash and task ID. Distinct development
-instances can belong to one game group. Every final group is excluded
-in full from development. Each family reserves 180 learning instances and
-360 fresh validation instances before observing outcomes. A reserve is used
-only when required by sampling. With the supplied seed and original archives:
+manifest by archive member, content hash and task ID. Each family allocates
+180 learning games, 180 primary games and 180 meta games before observing
+outcomes. Every gate instance is separate from every learning and final
+instance and appears in only one round and gate. Each round also assigns
+disjoint game groups to its primary and meta panels. Distinct development
+instances may still share a game group across rounds or with a learning
+instance. Each final group is held out in full from development.
+
+Earlier registrations carry the protocol `rsi_original_parent_paired_v3_6x30`.
+Their gates targeted six historical failures, six historical successes and 18
+fresh games each, with fresh games filling any shortage. The round audit reads
+the recorded protocol and reproduces its sampling rule. The seed-42 final
+test has the following composition with the original archives.
 
 | Family | Official unseen validation | Official seen validation | Isolated training games | Final total |
 | --- | ---: | ---: | ---: | ---: |
@@ -100,18 +105,18 @@ in the checkout that runs the job. A text-model-only deployment sets
 python -m rsi_paired prepare-formal --families simple two --seed 42 \
   --games data/downloads/alfworld-tw-0.4.2.zip \
   --metadata data/downloads/json_2.1.1_json.zip \
-  --out runs/v3_6x30_inputs/panel.json
+  --out runs/v3_6x30_fresh_inputs/panel.json
 python -m rsi_paired prepare-smoke --v3 \
   --games data/downloads/alfworld-tw-0.4.2.zip \
   --metadata data/downloads/json_2.1.1_json.zip \
-  --exclude runs/v3_6x30_inputs/panel.json --out runs/v3_6x30_inputs/smoke.json
-python -m rsi_paired smoke --manifest runs/v3_6x30_inputs/smoke.json \
-  --model-config runs/local-model.json --out runs/v3_smoke_natural
-python -m rsi_paired smoke --exercise-pair --manifest runs/v3_6x30_inputs/smoke.json \
-  --model-config runs/local-model.json --out runs/v3_smoke_forced
+  --exclude runs/v3_6x30_fresh_inputs/panel.json --out runs/v3_6x30_fresh_inputs/smoke.json
+python -m rsi_paired smoke --manifest runs/v3_6x30_fresh_inputs/smoke.json \
+  --model-config runs/local-model.json --out runs/v3_smoke_fresh_natural
+python -m rsi_paired smoke --exercise-pair --manifest runs/v3_6x30_fresh_inputs/smoke.json \
+  --model-config runs/local-model.json --out runs/v3_smoke_fresh_forced
 python -m rsi_paired campaign \
-  --manifest runs/v3_6x30_inputs/panel.json \
-  --model-config runs/local-model.json --out runs/v3_6x30
+  --manifest runs/v3_6x30_fresh_inputs/panel.json \
+  --model-config runs/local-model.json --out runs/v3_6x30_fresh
 ```
 
 Repeat the same campaign command and configuration to resume. The registration
@@ -128,5 +133,5 @@ separately from committed batches. `evolution_memory.json` binds the export to r
 Inspect any completed round with:
 
 ```bash
-python -m rsi_paired.audit runs/v3_6x30/simple/evolution-01
+python -m rsi_paired.audit runs/v3_6x30_fresh/simple/evolution-01
 ```

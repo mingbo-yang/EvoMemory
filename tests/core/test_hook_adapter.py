@@ -6,12 +6,14 @@ import asyncio
 import copy
 import json
 from pathlib import Path
+from runpy import run_path
 import sys
 import types
 import unittest
 import tempfile
 from unittest.mock import patch
 
+from evomem.alma_backend import ALFWORLD_ACTION_POLICY, _alfworld_actor_prompt
 from phase1_codegen.hook_adapter import HookAdapter, HookExecutionError, active_hook
 
 
@@ -242,6 +244,29 @@ class HookAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.workflow.env.actions, [('task-a', 'act'), ('task-a', 'act')])
         self.assertEqual(session.commits, 0)
         self.assert_restored()
+
+    async def test_alfworld_actor_uses_current_command_list_with_each_memory_update(self):
+        template = run_path(str(OFFICIAL.parents[2] / 'envs_archive/prompts/alfworld_prompt.py'))
+        upstream = template['get_alfworld_prompt']
+        policy = template['ALFWORLD_BASIC_PROMPT']
+
+        async def render(**kwargs):
+            return upstream(**kwargs)
+
+        self.workflow.env.get_prompt = _alfworld_actor_prompt(render, policy)
+        _, _, adapter = await self.invoke()
+        self.assertEqual(len(self.requests), 2)
+        self.assertNotEqual(adapter.injections[0]['memory'], adapter.injections[1]['memory'])
+        for index, (request, injection) in enumerate(zip(self.requests, adapter.injections)):
+            with self.subTest(step=index):
+                obs = 'initial task-a' if index == 0 else 'next task-a 1'
+                original_system, original_user = upstream(obs, ['act'], injection['memory'])
+                system = request['messages'][0]['content']
+                self.assertEqual(system, ALFWORLD_ACTION_POLICY + original_system['content'][len(policy):])
+                self.assertIn('Copy that line verbatim', system)
+                self.assertNotIn('put [object]', system)
+                self.assertEqual(request['user'], original_user['content'])
+                self.assertEqual(system, injection['system_message'])
 
     async def test_empty_hook_preserves_exact_original_requests(self):
         await self.workflow.run_single_task('task-a', progress=Progress(), task_id='task-a')

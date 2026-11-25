@@ -8,9 +8,9 @@ import sys
 from evomem.common import file_hash
 
 from .audit import Audit, audit_run
-from .panel import FAMILIES, save_registration
+from .panel import COEVOLUTION_MIXED_10X60_PROTOCOL, FAMILIES, save_registration
 from .runner import initial_state, open_stage
-from .workflow import _Journal, _lock, _read, _seed, _validate_score, digest
+from .workflow import _Journal, _evaluate_candidates, _lock, _read, _seed, digest
 
 
 def _campaign_tasks(manifest):
@@ -89,29 +89,31 @@ def _stage_spec(root, manifest, name):
     raise ValueError("Unknown panel stage")
 
 
+def _native_evaluation_key(fingerprint, source, tasks, seeds, arm=None):
+    binding = [fingerprint, source, tasks, seeds, "empty-family-memory"]
+    if arm is not None:
+        binding.append(arm)
+    return digest(binding)
+
+
 def _native_panel(root, adapter, states, tasks, seed, *, arms=None):
     if arms is not None and (len(arms) != len(states) or len(set(arms)) != len(states)):
         raise ValueError("Each independently executed frozen arm needs a distinct name")
     journal = _Journal(root / "batch", adapter, 2)
     seeds = [_seed(seed, "native", t["id"]) for t in tasks]
-    programs = {}
-    results = []
+    keys = []
+    evaluations = {}
     for index, state in enumerate(states):
-        source, policy = state["mechanism"], state["evolver"]
-        binding = [adapter.fingerprint, source, tasks, seeds, "empty-family-memory"]
-        if arms is not None:
-            binding.append(arms[index])
-        key = digest(binding)
-        if key not in programs:
-            def evaluate():
-                rows = adapter.evaluate(source, {}, tasks, seeds)
-                if len(rows) != len(tasks):
-                    raise ValueError("Incomplete frozen panel")
-                for row, task in zip(rows, tasks):
-                    _validate_score(row, task, classified=arms is not None)
-                return rows
+        source = state["mechanism"]
+        arm = None if arms is None else arms[index]
+        key = _native_evaluation_key(adapter.fingerprint, source, tasks, seeds, arm)
+        keys.append(key)
+        evaluations[key] = (source, {})
 
-            programs[key] = journal.job("evaluation/" + key, key, evaluate)
+    programs = _evaluate_candidates(journal, evaluations.items(), tasks, seeds, classified=arms is not None)
+    results = []
+    for index, (state, key) in enumerate(zip(states, keys, strict=True)):
+        source, policy = state["mechanism"], state["evolver"]
         rows = programs[key]
         categories = defaultdict(Counter)
         for task, row in zip(tasks, rows):
@@ -131,6 +133,7 @@ def _native_panel(root, adapter, states, tasks, seed, *, arms=None):
                 episode["recorded_steps"] = row["evidence"]["steps"]
 
     audit = Audit(root)
+    audit.is_mixed = getattr(adapter, "protocol", None) == COEVOLUTION_MIXED_10X60_PROTOCOL
     audit.costs_and_wire()
     for state, item in zip(states, results):
         key = item["evaluation_key"]

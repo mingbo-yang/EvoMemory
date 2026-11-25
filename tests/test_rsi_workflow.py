@@ -1,5 +1,6 @@
 """Synthetic protocol checks. Scores here are fixtures, not experimental results."""
 import json
+import threading
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
@@ -81,6 +82,42 @@ class Synthetic:
         return {"scope": "native"}
 
 
+class ConcurrentSynthetic(Synthetic):
+    """Exercise coordinator isolation and real overlap without any external service."""
+    candidate_workers = 2
+
+    def __init__(self):
+        super().__init__()
+        self.owner = threading.get_ident()
+        self.first_pair = threading.Barrier(2)
+        self.lock = threading.Lock()
+        self.active = self.peak = 0
+        self.attempts = []
+        self.fail_once = False
+
+    def set_job(self, path):
+        assert threading.get_ident() == self.owner
+        super().set_job(path)
+
+    def evaluate_isolated(self, path, source, memory, tasks, seeds):
+        assert path.name == "private" and path.parent.parent.name == "evaluation"
+        phase = tasks[0]["id"].split("-")[0]
+        with self.lock:
+            self.attempts.append((phase, source, path))
+            self.active += 1
+            self.peak = max(self.active, self.peak)
+        try:
+            if phase == "primary" and source in ("original", "P1"):
+                self.first_pair.wait(timeout=10)
+            if self.fail_once and phase == "meta" and source == "O1":
+                self.fail_once = False
+                raise OSError("synthetic interrupted candidate")
+            return super().evaluate(source, memory, tasks, seeds)
+        finally:
+            with self.lock:
+                self.active -= 1
+
+
 class PairedWorkflowTests(unittest.TestCase):
     def setUp(self):
         self.temp = TemporaryDirectory()
@@ -90,6 +127,39 @@ class PairedWorkflowTests(unittest.TestCase):
 
     def execute(self, **kwargs):
         return run_batch(self.root, state=state(), panels=panels(), adapter=self.a, **kwargs)
+
+    def test_parallel_evaluation_matches_serial_in_both_gates(self):
+        self.a.scores.clear()  # Parent and retained share their meta evaluation.
+        serial = self.execute()
+        parallel = ConcurrentSynthetic()
+        parallel.scores.clear()
+        root = self.root / "parallel"
+        actual = run_batch(root, state=state(), panels=panels(), adapter=parallel)
+        self.assertEqual(actual, serial)
+        self.assertEqual(parallel.peak, 2)
+        self.assertCountEqual(parallel.evals, self.a.evals)
+        self.assertEqual(parallel.evals.count(("meta", "original")), 1)
+        for gate in ("primary", "meta"):
+            self.assertEqual((root / f"{gate}_results.json").read_bytes(),
+                             (self.root / f"{gate}_results.json").read_bytes())
+
+    def test_parallel_resume_reuses_completed_candidates(self):
+        adapter = ConcurrentSynthetic()
+        adapter.fail_once = True
+        args = dict(state=state(), panels=panels(), adapter=adapter)
+        with self.assertRaisesRegex(InfrastructurePending, "interrupted candidate"):
+            run_batch(self.root, **args)
+        self.assertFalse((self.root / "meta_results.json").exists())
+        self.assertFalse((self.root / "commit.json").exists())
+        finished = dict((path, (path.parent / "result.json").read_bytes()) for _, _, path in adapter.attempts
+                        if (path.parent / "result.json").exists())
+        num_attempts = len(adapter.attempts)
+        actual = run_batch(self.root, **args)
+        self.assertEqual(actual["mechanism"], "N3")
+        self.assertFalse({path for _, _, path in adapter.attempts[num_attempts:]} & finished.keys())
+        self.assertTrue(all((p.parent / "result.json").read_bytes() == data for p, data in finished.items()))
+        self.assertEqual(len(adapter.calls), 9)
+        self.assertEqual(adapter.active, 0)
 
     def test_same_mother_matched_public_evidence_and_real_slots(self):
         result = self.execute()

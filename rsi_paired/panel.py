@@ -1,4 +1,4 @@
-"""Register official ALFWorld instances and resolve outcome-stratified development panels."""
+"""Register official ALFWorld games and resolve each protocol's development panels."""
 import hashlib
 import json
 import re
@@ -160,7 +160,34 @@ def formal_manifest(games_path, metadata_path, seed, excluded_groups=(), exclude
                 excluded_games_hash=digest(sorted(excluded_games)))
 
 
-SEQUENTIAL_PROTOCOL = "rsi_original_parent_paired_v3_6x30"
+HISTORICAL_SEQUENTIAL_PROTOCOL = "rsi_original_parent_paired_v3_6x30"
+SEQUENTIAL_PROTOCOL = "rsi_original_parent_paired_v3_6x30_fresh"
+SEQUENTIAL_PROTOCOLS = (HISTORICAL_SEQUENTIAL_PROTOCOL, SEQUENTIAL_PROTOCOL)
+COEVOLUTION_PROTOCOL = "rsi_reviewer_evolver_v4_hard_10x50"
+COEVOLUTION_BATCH_SIZE = 50
+COEVOLUTION_MAX_ROUNDS = 10
+COEVOLUTION_6X30_PROTOCOL = "rsi_reviewer_evolver_v4_hard_6x30"
+COEVOLUTION_HEAT_5X23_PROTOCOL = "rsi_reviewer_evolver_v4_heat_5x23"
+COEVOLUTION_MIXED_10X60_PROTOCOL = "rsi_reviewer_evolver_v4_mixed_10x60"
+MIXED_FAMILIES = tuple(sorted(FAMILIES.values()))
+COEVOLUTION_PROTOCOLS = (COEVOLUTION_PROTOCOL, COEVOLUTION_6X30_PROTOCOL, COEVOLUTION_HEAT_5X23_PROTOCOL,
+                         COEVOLUTION_MIXED_10X60_PROTOCOL)
+NATIVE_PAIRED_PROTOCOLS = (*SEQUENTIAL_PROTOCOLS, *COEVOLUTION_PROTOCOLS)
+
+
+def coevolution_shape(protocol):
+    if protocol == COEVOLUTION_PROTOCOL:
+        return COEVOLUTION_MAX_ROUNDS, COEVOLUTION_BATCH_SIZE
+    if protocol == COEVOLUTION_6X30_PROTOCOL:
+        return 6, 30
+    if protocol == COEVOLUTION_HEAT_5X23_PROTOCOL:
+        return 5, 23
+    if protocol == COEVOLUTION_MIXED_10X60_PROTOCOL:
+        return 10, 60
+    raise ValueError(f"Unknown coevolution protocol: {protocol}")
+
+
+
 SEQUENTIAL_SCOPE = "formal_alfworld_sequential_families"
 DEFAULT_FAMILIES = ("simple", "two")
 FAMILY_ROUNDS = 6
@@ -178,23 +205,23 @@ def _sequential_budget():
                 max_native_episodes_per_family=maximum, max_native_episodes_total=2 * maximum)
 
 
-def _partition_fresh(rows):
-    """Keep both 30-game reserves feasible, including when all historical games are unusable."""
-    first, second = rows[:FAMILY_BATCH_SIZE], rows[FAMILY_BATCH_SIZE:]
+def _partition_fresh(rows, size=FAMILY_BATCH_SIZE):
+    """Give both fresh reserves the registered width while keeping sibling trials on one side."""
+    first, second = rows[:size], rows[size:]
     if not ({row[0] for row in first} & {row[0] for row in second}):
         return first, second
     # Assign sibling trials to one side. Prefer groups in their seeded input order.
     sizes = Counter(row[0] for row in rows)
     picked = {0: ()}
-    for group, size in sizes.items():
+    for group, group_size in sizes.items():
         for total, previous in tuple(picked.items()):
-            if total + size <= FAMILY_BATCH_SIZE:
-                picked.setdefault(total + size, previous + (group,))
-        if FAMILY_BATCH_SIZE in picked:
+            if total + group_size <= size:
+                picked.setdefault(total + group_size, previous + (group,))
+        if size in picked:
             break
-    if FAMILY_BATCH_SIZE not in picked:
+    if size not in picked:
         raise ValueError("Cannot register two complete group-disjoint fresh reserves")
-    primary = set(picked[FAMILY_BATCH_SIZE])
+    primary = set(picked[size])
     return [r for r in rows if r[0] in primary], [r for r in rows if r[0] not in primary]
 
 
@@ -321,7 +348,7 @@ def sequential_manifest(games_path, metadata_path, seed, families=DEFAULT_FAMILI
 
 def validate_sequential_manifest(manifest):
     order, families = manifest["family_order"], manifest["families"]
-    if (manifest.get("protocol") != SEQUENTIAL_PROTOCOL or manifest.get("scope") != SEQUENTIAL_SCOPE
+    if (manifest.get("protocol") not in SEQUENTIAL_PROTOCOLS or manifest.get("scope") != SEQUENTIAL_SCOPE
             or type(manifest["seed"]) is not int or manifest["games_sha256"] != GAME_SHA
             or len(order) != 2 or len(set(order)) != 2 or set(order) != set(families)
             or not set(order) <= set(FAMILIES.values())):
@@ -449,16 +476,37 @@ def _allocate_gates(panels, history, seed):
         raise ValueError("Incomplete or overlapping group assignment")
     return chosen
 
-def resolve_family_panels(panels, learning_tasks, ledger, seed):
-    """Select both gates only from frozen reserves and verified, pre-search learning outcomes."""
-    if set(panels) != {"learning", *GATES} or any(len(v) != FAMILY_BATCH_SIZE for v in panels.values()):
+def validate_mixed_round(panels):
+    phases = ("learning", *GATES)
+    if set(panels) != set(phases) or any(Counter(t["family"] for t in panels[p]) != dict.fromkeys(MIXED_FAMILIES, 10)
+                                         for p in phases):
+        raise ValueError("Each mixed phase requires exactly ten tasks from each of six families")
+    _check_fresh_groups(panels)
+
+
+def resolve_family_panels(panels, learning_tasks, ledger, seed, *, protocol=SEQUENTIAL_PROTOCOL):
+    """Use registered games in order. Earlier registrations retain outcome-stratified sampling."""
+    if protocol not in NATIVE_PAIRED_PROTOCOLS:
+        raise ValueError("Unknown sequential panel protocol")
+    size, rounds = FAMILY_BATCH_SIZE, FAMILY_ROUNDS
+    if protocol in COEVOLUTION_PROTOCOLS:
+        rounds, size = coevolution_shape(protocol)
+    if set(panels) != {"learning", *GATES} or any(len(v) != size for v in panels.values()):
         raise ValueError("Invalid fresh reserve sizes")
-    if (not FAMILY_BATCH_SIZE <= len(learning_tasks) <= FAMILY_ROUNDS * FAMILY_BATCH_SIZE
-            or len(learning_tasks) % FAMILY_BATCH_SIZE or len(learning_tasks) != len(ledger)
-            or learning_tasks[-FAMILY_BATCH_SIZE:] != panels["learning"]):
+    if (not size <= len(learning_tasks) <= rounds * size
+            or len(learning_tasks) % size or len(learning_tasks) != len(ledger)
+            or learning_tasks[-size:] != panels["learning"]):
         raise ValueError("Learning prefix must end with this complete learning batch")
     cutoff_tasks = learning_tasks + panels["primary"] + panels["meta"]
-    if len({t["family"] for t in cutoff_tasks}) != 1:
+    families = {t["family"] for t in cutoff_tasks}
+    if protocol == COEVOLUTION_HEAT_5X23_PROTOCOL and families != {"heat"}:
+        raise ValueError("The 5x23 registration is specific to heat")
+    if protocol == COEVOLUTION_MIXED_10X60_PROTOCOL:
+        validate_mixed_round(panels)
+        expected = dict.fromkeys(MIXED_FAMILIES, len(learning_tasks) // len(MIXED_FAMILIES))
+        if Counter(t["family"] for t in learning_tasks) != expected:
+            raise ValueError("Mixed learning history differs from the six registered family quotas")
+    elif len(families) != 1:
         raise ValueError("Historical and fresh tasks must belong to the same family")
     for key in ("id", "archive_member", "game_sha256"):
         if len({t[key] for t in cutoff_tasks}) != len(cutoff_tasks):
@@ -472,13 +520,18 @@ def resolve_family_panels(panels, learning_tasks, ledger, seed):
                 or type(score) not in (int, float) or score not in (0, 1)
                 or type(row.get("score")) not in (int, float) or row["score"] != score
                 or not re.fullmatch(r"[0-9a-f]{64}", row.get("episode_hash") or "")):
-            raise ValueError("Historical sampling requires ordered completed learning episodes with native binary scores")
+            raise ValueError("Validation gates require ordered completed learning episodes with native binary scores")
         history[int(score)].append((index, task, row))
-    chosen = _allocate_gates(panels, history, seed)
+    if protocol == HISTORICAL_SEQUENTIAL_PROTOCOL:
+        chosen = _allocate_gates(panels, history, seed)
+        for gate in GATES:
+            chosen[gate].sort(key=lambda p: digest([seed, "gate-order", gate, p[0]["id"]]))
+    else:
+        chosen = {gate: [(task, {"task_id": task["id"], "source": "fresh"}) for task in panels[gate]]
+                  for gate in GATES}
     resolved, sampling = {"learning": list(panels["learning"])}, {}
     for gate in GATES:
         selected = chosen[gate]
-        selected.sort(key=lambda p: digest([seed, "gate-order", gate, p[0]["id"]]))
         resolved[gate] = [task for task, _ in selected]
         entries = [entry for _, entry in selected]
         counts = Counter(entry["source"] for entry in entries)

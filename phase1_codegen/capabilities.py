@@ -118,6 +118,13 @@ class LocalModelCapabilities:
         if not manifest_path.exists():
             write(manifest_path, self.manifest)
 
+    def _record_cost(self, row):
+        # Different exact requests have different cache locks but share this ledger.
+        self.ledger.parent.mkdir(parents=True, exist_ok=True)
+        with self.ledger.with_suffix(".lock").open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            append(self.ledger, row)
+
     def describe(self):
         """Compact operational catalog; do not include mechanism suggestions."""
         rows = [{k: v for k, v in row.items() if k not in {'model_files', 'system'}}
@@ -225,7 +232,7 @@ class LocalModelCapabilities:
         try:
             normalized = self._validated_payload(model_id, payload)
         except Exception as exc:
-            append(self.ledger, dict(kind='memory_model_call', environment=self.environment, phase=self.phase,
+            self._record_cost(dict(kind='memory_model_call', environment=self.environment, phase=self.phase,
                 operation=operation, model_id=model_id, request_hash=raw_hash, ok=False,
                 cache_hit=False, physical=False, error=type(exc).__name__ + ': ' + str(exc), seconds=time.monotonic()-started))
             raise
@@ -282,7 +289,7 @@ class LocalModelCapabilities:
                            capability_fingerprint=self.fingerprint, seconds=time.monotonic()-started,
                            usage=public_usage(cached['usage']) if not hit else {},
                            measurement_kind='local_model_inference')
-            append(self.ledger, receipt)
+            self._record_cost(receipt)
             if not cached['ok']:
                 error_type = (CapabilityContractError if cached.get('failure_kind') == 'request_contract'
                               else CapabilityInfrastructureError)

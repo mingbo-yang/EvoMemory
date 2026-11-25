@@ -12,6 +12,24 @@ from phase1_codegen.tokenization import Tokenizer, _single_sequence_length
 
 
 class TokenSequenceTests(unittest.TestCase):
+    def test_gemma_service_renders_text_as_openai_content_parts(self):
+        rendered = []
+        def render(messages, **kwargs):
+            rendered.append(messages)
+            return [1, 2]
+
+        tokenizer = Tokenizer.__new__(Tokenizer)
+        tokenizer.impl = types.SimpleNamespace(apply_chat_template=render)
+        original = [{'role': 'system', 'content': 'Choose one action.'},
+                    {'role': 'user', 'content': [{'type': 'text', 'text': 'A room.'}]}]
+        tokenizer.model_name = 'gemma4-31b'
+        tokenizer.chat_count(original)
+        self.assertEqual(rendered[-1], [{'role': 'system', 'content': [{'type': 'text', 'text': 'Choose one action.'}]},
+                                        original[1]])
+        tokenizer.model_name = 'qwen3.8-27b-local'
+        tokenizer.chat_count(original)
+        self.assertEqual(rendered[-1][0]['content'], 'Choose one action.')
+
     def test_mapping_list_and_numpy_count_tokens_not_fields(self):
         for value in ([7, 8, 9], [[7, 8, 9]],
                       {'input_ids': [7, 8, 9], 'attention_mask': [1, 1, 1]},

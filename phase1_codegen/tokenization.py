@@ -8,6 +8,7 @@ from collections.abc import Mapping, Sequence
 import inspect
 from numbers import Integral
 
+from evomem.common import MODEL
 from evomem.services import Tokenizer as HistoricalTokenizer
 
 
@@ -43,10 +44,20 @@ def _single_sequence_length(value):
 class Tokenizer(HistoricalTokenizer):
     """Only chat_count differs; count and clip are inherited unchanged."""
 
+    model_name = None
+
+    def __init__(self, path=MODEL, *, model_name=None):
+        super().__init__(path)
+        self.model_name = model_name
+
     def chat_count(self, messages):
         if (isinstance(messages, (str, bytes)) or not isinstance(messages, Sequence)
                 or not messages or any(not isinstance(message, Mapping) for message in messages)):
             raise ValueError('chat_count requires one nonempty conversation, not a batch')
+        if self.model_name == 'gemma4-31b':
+            # The registered vLLM Gemma template is rendered in OpenAI content-part format.
+            messages = [dict(message, content=[{'type': 'text', 'text': message['content']}])
+                        if isinstance(message.get('content'), str) else message for message in messages]
         method = self.impl.apply_chat_template
         kwargs = dict(tokenize=True, add_generation_prompt=True, enable_thinking=False)
         try:

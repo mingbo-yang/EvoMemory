@@ -54,6 +54,7 @@ class Audit:
         self.report = dict(status="partial", findings=self.errors, slots=self.slots, scores={}, costs={},
                            coverage={}, unresolved_jobs=[], barrier={})
         self.real = (root / "runtime.json").exists()
+        self.is_mixed = False
 
     def check(self, ok, message):
         if not ok and message not in self.errors:
@@ -219,6 +220,9 @@ class Audit:
         if actual["status"] in ("method_eval_failure", "deployed_learning_hook_failure"):
             self.check(after == before, f"Failed native candidate changed memory for {job}/{index}")
             return bank
+        if self.is_mixed:
+            self.check(after["memory_scope"] == "family" and after["families"] == [family],
+                       f"Mixed evaluation reused a different task-family bank for {job}/{index}")
         self.check(after["family"] == family and after["source_log_hash"] ==
                    digest([before["source_log_hash"], actual["episode_hash"]]), f"Native memory chain mismatch for {job}/{index}")
         return {**bank, family:after}
@@ -249,6 +253,10 @@ class Audit:
                            f"Retry changed actual proposal request {label}/{index}")
             request = binding["request"]
             body = json.loads(request["messages"][-1]["content"])
+            from .panel import COEVOLUTION_PROTOCOLS
+            if self.load("registration.json")["protocol"] in COEVOLUTION_PROTOCOLS:
+                self.check(body.get("proposal_slot") == {"index": int(label[1:]), "count": 3},
+                           f"Wrong proposal slot on wire {label}/{index}")
             feedback = {k: body[k] for k in ("own_draft", "own_contract_error") if k in body}
             self.check(digest(body["public_evidence"]) == digest(packet) and item["policy_hash"] == expected
                        and body["current_source"] == original
@@ -454,15 +462,20 @@ class Audit:
                                               valid_versions=len(evals), distinct_panel_executions=len(set(evals.values())))
         return records
 
-    def _displayed_evidence(self, rows, omission):
+    def _displayed_evidence(self, rows, omission, compact_refs=False):
         from .roles import _evidence_counts
+        archived = (omission or {}).get("layout") == "archive_refs_v1"
         originals = {path + "/evidence": row["evidence"] for path, row, shown in rows
                      if "evidence" in row and isinstance(shown.get("evidence"), dict)}
         reduced = []
         for path, row, shown in rows:
             facts, visible = row.get("evidence"), shown.get("evidence")
+            episode_hash = row.get("episode_hash")
+            prefix = episode_hash[:16] if compact_refs and episode_hash else row.get("episode_hash_prefix")
             self.check(all(row.get(k) == shown.get(k) for k in
-                           ("task_id", "score", "native_score", "episode_hash", "status")),
+                           ("task_id", "score", "native_score", "status", "candidate_error"))
+                       and shown.get("episode_hash") == (None if compact_refs else episode_hash)
+                       and shown.get("episode_hash_prefix") == prefix,
                        f"Shared evidence differs from its episode identity or native result: {path}")
             if "evidence_ref" in shown:
                 ref = shown["evidence_ref"]
@@ -470,16 +483,21 @@ class Audit:
                            f"Shared evidence reference differs from its episode: {path}/evidence")
             elif facts != visible:
                 fingerprint = digest(facts)
-                self.check(isinstance(facts, dict) and visible == _evidence_counts(facts)
-                           and (shown.get("episode_hash") or shown.get("full_witness_hash") == fingerprint),
+                self.check(isinstance(facts, dict) and visible == ({} if archived else _evidence_counts(facts))
+                           and (shown.get("episode_hash") or shown.get("episode_hash_prefix")
+                                or shown.get("full_witness_hash") == fingerprint),
                            f"Directly displayed evidence differs from the archived facts: {path}")
                 reduced.append([path, fingerprint])
         expected = ({"episode_witnesses_reduced": len(reduced), "witnesses_hash": digest(reduced)}
                     if reduced else None)
+        if archived and expected:
+            expected["layout"] = "archive_refs_v1"
         self.check(omission == expected, "Displayed evidence omission receipt differs from the archived facts")
 
     def family_feedback(self, shared, primary, recent_rows):
         """Resolve any deduplicated public values against the original episode and source."""
+        from .roles import _expand_public_rows
+        shared = _expand_public_rows(shared)
         slots = shared["primary"]
         sources = {f"/primary/{name}/source": val["source"] for name, val in slots.items()
                    if isinstance(val.get("source"), str)}
@@ -488,13 +506,27 @@ class Audit:
         pre = self.load("H_pre.json")
         recent = pre.get("recent_learning", [])
         visible = shared["pre"].get("recent_learning", [])
+        if self.is_mixed and self.real:
+            from .coevolution_roles import _learning_counts, paired_family_outcomes
+            recent_families = [r["family"] for r in recent_rows]
+            learning_counts = {"learning": _learning_counts(recent_rows)}
+            expected = {name: paired_family_outcomes(primary["parent"]["evaluation"], record["evaluation"])
+                        if "evaluation" in record else None for name, record in primary.items()}
+            key = "mixed.family_outcomes"
+            self.check(pre.get(key) == shared["pre"].get(key) == learning_counts and shared.get(key) == expected
+                       and key in pre["evidence_ids"] and key in shared["evidence_ids"],
+                       "Public family summaries differ from the registered native outcomes")
+            self.check([r.get("family") for r in recent] == [r.get("family") for r in visible] == recent_families,
+                       "Public history changed mixed learning task-family labels")
         self.check(len(recent_rows) == len(recent) == len(visible), "Shared feedback omits registered recent learning rows")
         self._displayed_evidence([(f"/recent_learning/{i}", _public_episode(row), shown)
-                                  for i, (row, shown) in enumerate(zip(recent_rows, recent))], pre.get("omission"))
+                                  for i, (row, shown) in enumerate(zip(recent_rows, recent))], pre.get("omission"),
+                                 pre.get("compact_episode_refs", False))
         rows = [(f"/pre/recent_learning/{i}", original, shown)
                 for i, (original, shown) in enumerate(zip(recent, visible))]
         sampling = self.report.get("panel_sampling")
-        for name, record in primary.items():
+        for name in sorted(primary):  # Compression uses canonical JSON key order for omission receipts.
+            record = primary[name]
             view = slots[name]
             if "source_ref" in view:
                 self.check("source" not in view and view["source_ref"] in sources
@@ -511,12 +543,16 @@ class Audit:
                         for i, r in enumerate(evaluated)]
             labels = [(r.get("task_id"), r.get("gate_source"), r.get("score")) for r in shown]
             self.check(labels == expected, f"Shared feedback mislabels primary evaluation rows: {name}")
+            if self.is_mixed and self.real:
+                self.check([r.get("family") for r in shown] == [r["family"] for r in evaluated],
+                           f"Public feedback changed mixed task-family labels: {name}")
             rows.extend((f"/primary/{name}/evaluation/{i}", _public_episode(row), displayed)
                         for i, (row, displayed) in enumerate(zip(evaluated, shown)))
-        self._displayed_evidence(rows, shared.get("omission"))
+        self._displayed_evidence(rows, shared.get("omission"), shared.get("compact_episode_refs", False))
 
     def review_receipts(self, phase, records, mother, reported, retained=None):
-        from .roles import _displayed_hash, _review_findings, _review_witness_index, _score_view, decode_role_response
+        from .roles import (_displayed_hash, _review_findings, _review_layout,
+                            _review_witness_index, _score_view, decode_role_response)
         names = ["parent", "P1", "P2", "P3"] if phase == "primary" else [
             "retained", "parent", "O1", "O2", "O3", "N1", "N2", "N3"]
         entries = self.report.get("panel_sampling", {}).get(phase, {}).get("entries", [])
@@ -524,7 +560,12 @@ class Audit:
                                     mother["learning_cutoff"], retained)
         records_hash = digest(published)
         evidence = {"parent.source": mother["framework"], **{f"{phase}.{k}": _score_view(r) for k, r in published.items()}}
-        witnesses = _review_witness_index(evidence)
+        mixed = self.is_mixed
+        if mixed:
+            from .coevolution_roles import mixed_review_view
+            mixed_body, witnesses = mixed_review_view(evidence)
+        else:
+            witnesses = _review_witness_index(evidence)
         errors = []
         value = None
         for job in ([f"reviews/{phase}"] if phase == "primary" else ["reviews/meta", "reviews/meta_correction"]):
@@ -552,14 +593,22 @@ class Audit:
                 request = self.intents[key][0]["request"]
                 body = json.loads(request["messages"][-1]["content"])
                 kept = body.get("episode_witnesses", {})
-                self.check(body["evidence"] == evidence and kept == dict(list(witnesses.items())[:len(kept)])
+                layout = body.get("evidence_layout")
+                if mixed:
+                    contents = {k: v for k, v in body.items() if k not in ("episode_witnesses", "omitted_witness_count", "format_correction")}
+                    shown_witnesses = witnesses
+                    matches = layout == "mixed_families_v1" and contents == mixed_body
+                else:
+                    displayed, shown_witnesses = _review_layout(evidence, witnesses, layout)
+                    matches = body["evidence"] == displayed and body.get("evidence_source_hash") == (digest(evidence) if layout else None)
+                self.check(matches and kept == dict(list(shown_witnesses.items())[:len(kept)])
                            and body.get("omitted_witness_count", 0) == len(witnesses) - len(kept)
                            and body.get("format_correction") == prior,
                            f"Reviewer saw different evidence, attribution or correction: {job}")
                 wire_hash = _displayed_hash(body)
                 response = read(self.root / "roles/requests" / key / "response.json")
                 try:
-                    actual = _review_findings(decode_role_response(response, request["model"]), evidence)
+                    actual = _review_findings(decode_role_response(response, request["model"]), body["evidence"] if mixed else evidence)
                 except ContractError as exc:
                     bad = dict(request_key=key, response_hash=digest(response),
                                output_hash=digest(response["choices"][0]["message"].get("content")),
@@ -596,10 +645,20 @@ class Audit:
         if not registration:
             self.report["stage"] = "awaiting_batch_registration"
             return
-        from .panel import SEQUENTIAL_PROTOCOL
-        v3 = registration["protocol"] == SEQUENTIAL_PROTOCOL
+        from .panel import (COEVOLUTION_MIXED_10X60_PROTOCOL, COEVOLUTION_PROTOCOLS, NATIVE_PAIRED_PROTOCOLS,
+                            coevolution_shape, validate_mixed_round)
+        self.is_mixed = registration["protocol"] == COEVOLUTION_MIXED_10X60_PROTOCOL
+        if self.is_mixed:
+            validate_mixed_round(registration["panels"])
+        v4 = registration["protocol"] in COEVOLUTION_PROTOCOLS
+        v3 = registration["protocol"] in NATIVE_PAIRED_PROTOCOLS
+        if v4:
+            width = coevolution_shape(registration["protocol"])[1]
+            panels = registration["panels"]
+            self.check(set(panels) == {"learning", "primary", "meta"} and all(len(rows) == width for rows in panels.values()),
+                       "Co-evolution panel width differs from registered protocol")
         self.check(v3 or registration["protocol"] == PROTOCOL, "Unknown registered batch protocol")
-        if v3:
+        if v3 and not v4:
             decision_dirs = {p.name for p in (self.batch/"jobs/decision").glob("*") if p.is_dir()}
             self.check(decision_dirs <= {"0"}, "v3 allocated a second self-decision opportunity")
             reviews = {p.name for p in (self.batch/"jobs/reviews").glob("*") if p.is_dir()}
@@ -676,10 +735,10 @@ class Audit:
                 return
             plan = registration["panels"]
             resolved = resolve_family_panels(plan, registration["learning_history_tasks"] + plan["learning"],
-                                             earlier + recent_rows, registration["seed"])
+                                             earlier + recent_rows, registration["seed"], protocol=registration["protocol"])
             if not self.check(self.load("resolved_panels.json") == resolved
                               and mother.get("resolved_panels_hash") == digest(resolved),
-                              "Resolved validation gates differ from the registered learning outcomes"):
+                              "Resolved validation gates differ from the registered protocol"):
                 return
             # The registration hash in the mother binds the original fresh
             # reserves. Native evaluation jobs bind the gates resolved above.
@@ -688,9 +747,11 @@ class Audit:
         old_hash = None
         revision = self.outcome("revision")
         new_hash = digest(revision["value"]) if revision and revision["ok"] else None
+        if v4 and new_hash is not None:
+            new_hash = digest(revision["value"]["evolver"])
         for intents in self.intents.values():
             item = intents[0]
-            if item["role"] == "decide":
+            if not v4 and item["role"] == "decide":
                 old_policy = json.loads(item["request"]["messages"][-1]["content"])["current_strategy"]
                 old_hash = digest(old_policy)
                 if new_hash is not None:
@@ -706,6 +767,8 @@ class Audit:
             self.check(old_hash == digest(starting["evolver"]), "Proposal policy differs from the batch starting state")
         for prefix in "PON":
             packet = self.load("H_pre.json" if prefix == "P" else "H_shared.json")
+            if v4 and prefix in ("O", "N"):
+                packet = self.load("H_meta_old.json" if prefix == "O" else "H_meta_new.json")
             for i in (1,2,3):
                 self.slot(f"{prefix}{i}",packet,mother,old_hash,new_hash)
         for i in (1,2,3):
@@ -739,6 +802,11 @@ class Audit:
             if v3:
                 self.family_feedback(shared, primary, recent_rows)
                 self.review_receipts("primary", primary, mother, shared["review"])
+                if v4:
+                    for name in ("H_meta_old.json", "H_meta_new.json"):
+                        packet = self.load(name)
+                        if packet is not None:
+                            self.family_feedback(packet, primary, recent_rows)
         meta = self.panel("meta",registration,mother,(primary,keep))
         if commit is None:
             self.report["stage"] = "decision_revision_or_paired_search" if meta is None else "awaiting_final_commit"
@@ -747,6 +815,20 @@ class Audit:
             return
         state = commit["state"]
         event = state["history"][-1]
+        if self.is_mixed:
+            from .coevolution_roles import paired_family_outcomes
+            expected = {}
+            for records in (primary, meta):
+                if records is None:
+                    continue
+                for slot, record in records.items():
+                    if slot in ("parent", "retained"):
+                        continue
+                    expected[slot] = (paired_family_outcomes(records["parent"]["evaluation"], record["evaluation"])
+                                      if "evaluation" in record else None)
+            actual = {entry["slot"]: entry["family_outcomes"] for entry in event["modification_records"]}
+            self.check(actual == expected and len(actual) == len(event["modification_records"]),
+                       "Shared Evolution Memory differs from native paired family outcomes")
         if v3 and meta is not None:
             self.check(event["status"] == "paired_complete", "Sealed meta scores cannot be discarded by fallback")
         self.check(digest(state) == commit["state_hash"] and event["primary_best"] == keep
@@ -765,14 +847,34 @@ class Audit:
             old = winner(meta,["retained","parent","O1","O2","O3"])
             new = winner(meta,["retained","parent","N1","N2","N3"])
             adopted = meta[new]["success_count"] >= meta[old]["success_count"] + 1
+            if v4:
+                counts = []
+                for key, prefix in (("old", "O"), ("new", "N")):
+                    names = [n for n in (f"{prefix}1",f"{prefix}2",f"{prefix}3") if meta[n]["success_count"] is not None]
+                    best = winner(meta, names) if names else None
+                    count = meta[best]["success_count"] if best else None
+                    self.check(event[key + "_offspring_best"] == best and event[key + "_offspring_count"] == count,
+                               "Incorrect best valid offspring or native count: " + prefix)
+                    counts.append(count)
+                adopted = None not in counts and counts[1] > counts[0]
+                if self.is_mixed:
+                    from .coevolution_roles import paired_family_outcomes
+                    expected = None
+                    if None not in counts:
+                        expected = paired_family_outcomes(meta[event["old_offspring_best"]]["evaluation"],
+                                                          meta[event["new_offspring_best"]]["evaluation"])
+                    self.check(event["paired_optimizer_family_outcomes"] == expected,
+                               "Optimizer family comparison differs from the two best scored offspring")
             self.check((event["old_best"],event["new_best"],event["adopted"]) == (old,new,adopted),
                        "Decision does not reproduce on paired scores")
             selected, records = (new if adopted else old), meta
             policy_hash = new_hash if adopted else old_hash
             result.update(old_best=old,new_best=new,adopted=adopted)
         else:
-            self.check(event["status"] in ("budget_blocked","not_triggered","decision_error",
-                                          "invalid_self_revision","meta_incomplete"), "Unrecognized fallback")
+            fallbacks = {"budget_blocked", "not_triggered", "decision_error", "invalid_self_revision", "meta_incomplete"}
+            if v4:
+                fallbacks.add("invalid_paired_diagnosis")
+            self.check(event["status"] in fallbacks, "Unrecognized fallback")
         source = records[selected]["source"]
         self.check(event["selected"] == selected and state["mechanism"] == source
                    and event["selected_framework_hash"] == digest(source)
@@ -791,6 +893,9 @@ class Audit:
                        "Fallback does not follow original trigger decision")
         if event["status"] == "invalid_self_revision":
             self.check(revision is not None and not revision["ok"], "Invalid revision fallback lacks a rejection")
+        if v4:
+            from .coevolution_audit import verify_components
+            verify_components(self, starting, mother, state, decision, revision, shared)
         completed = event["status"] in ("paired_complete", "not_triggered")
         status = ("verified" if self.real else "verified_workflow_only") if completed else "verified_fallback"
         self.report.update(status=status, stage="committed",

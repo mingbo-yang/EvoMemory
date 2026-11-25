@@ -17,7 +17,7 @@ from phase1_codegen.outcomes import candidate_hook_failure
 from phase1_codegen.policy import Rejected
 from phase1_codegen.program import BASELINE_SOURCE, Program, WorkerStartupError
 from . import witness
-from .panel import SEQUENTIAL_PROTOCOL
+from .panel import COEVOLUTION_MIXED_10X60_PROTOCOL, NATIVE_PAIRED_PROTOCOLS
 from .workflow import LearningMechanismError, PROTOCOL, _sync_directory, _write
 
 
@@ -132,14 +132,16 @@ class Native:
     """Each public bank is a mapping from family to a validated, exact-program snapshot."""
 
     def __init__(self, root, tasks, tokenizer, model_fingerprint, *, base_url, model_name, capabilities=None,
-                 learning_archive=None, protocol=PROTOCOL):
+                 learning_archive=None, protocol=PROTOCOL, runtime_root=None):
+        if protocol not in (PROTOCOL, *NATIVE_PAIRED_PROTOCOLS):
+            raise ValueError("Unknown ALFWorld evaluation protocol")
         self.root = Path(root).resolve()
         self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.tokenizer = tokenizer
         self.capabilities = capabilities
         self.protocol = protocol
         self.learning_archive = Path(learning_archive) if learning_archive is not None else self.root / "learning"
-        self.engine = NativeEvaluator(self.root, tasks, tokenizer, model_fingerprint,
+        self.engine = NativeEvaluator(self.root if runtime_root is None else runtime_root, tasks, tokenizer, model_fingerprint,
                                       {'environment': 'alfworld', 'memory_scope': 'family'},
                                       capabilities=capabilities, base_url=base_url, model_name=model_name)
         self.model_name = model_name
@@ -290,8 +292,14 @@ class Native:
                 raise LearningMechanismError(learning_failure_evidence(directory, result))
             if result['row']['status'] == 'method_eval_failure':
                 return dict(memory), result['row']
+            snapshot = result['snapshot']
+            if getattr(self, "protocol", PROTOCOL) == COEVOLUTION_MIXED_10X60_PROTOCOL and (
+                    result['row']['family'] != family or snapshot['family'] != family
+                    or snapshot['families'] != [family] or snapshot['memory_scope'] != 'family'
+                    or json.loads(snapshot['context_wire']).get('family') != family):
+                raise ValueError('Native episode returned a different task-family bank')
             updated = dict(memory)
-            updated[family] = result['snapshot']
+            updated[family] = snapshot
             return updated, result['row']
 
     def _execute(self, directory, program, bank, before, task, seed, label):
@@ -322,13 +330,13 @@ class Native:
                            or r.get('original_message_hash') != digest(r['messages']) for r in actors)):
                 raise RuntimeError('Native Actor receipts differ from registered task, request or model')
             failure = bool(ep.get('error'))
-            learning_failure = failure and label == 'learning' and self.protocol == SEQUENTIAL_PROTOCOL
+            learning_failure = failure and label == 'learning' and self.protocol in NATIVE_PAIRED_PROTOCOLS
             if failure:
                 if (label != 'panel' and not learning_failure) or not candidate_hook_failure(ep, program.hash):
                     raise RuntimeError('Native task incomplete: ' + str(ep['error']))
                 if bank.fingerprint != before['memory_hash'] or ep['generated_memory_write_calls']:
                     raise RuntimeError('Failed candidate changed its private bank')
-                if learning_failure and not (
+                if (learning_failure or self.protocol == COEVOLUTION_MIXED_10X60_PROTOCOL) and not (
                         ep['task_id'] == task['id'] and ep['phase'] == label and ep['family'] == task['family']
                         and ep['environment'] == 'alfworld' and ep['seed'] == seed and ep['environment_seed'] == task['seed']
                         and ep['executor'] == 'ALMA.Agent_Workflow.run_single_task' and ep['synthetic'] is False

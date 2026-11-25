@@ -12,7 +12,8 @@ from pathlib import Path
 
 from evomem.common import append, dumps, write
 from evomem.memory import rank
-from evomem.services import LocalLLM, Tokenizer
+from evomem.services import LocalLLM
+from phase1_codegen.tokenization import Tokenizer
 from phase1_codegen.experience import ABI_FIELDS, RECORD_TOKENS, RETRIEVAL_LIMIT, RETRIEVAL_TOKENS, _error
 from phase1_codegen.policy import Rejected
 from phase1_codegen.program import Program, WorkerStartupError
@@ -82,6 +83,7 @@ ROLE_SETTINGS = {'propose': (.7, 6144), 'revise': (.7, 6144),
                  'decide': (0, 1024), 'review': (0, 3072), 'diagnose': (0, 3072)}
 MAX_POLICY_TEXT_BYTES = 4096
 MAX_EVIDENCE_REFERENCES = 32
+PUBLIC_EPISODE_TABLE = 'Each row starts with an index into columns, followed by the values in that column order.'
 
 
 def _text(value, *, empty=False):
@@ -143,13 +145,153 @@ def _program(package):
         raise ContractError(str(exc)) from exc
 
 
-def _public_rows(packet):
+def _public_row_groups(packet):
     prefix = '/pre' if 'pre' in packet else ''
-    for i, row in enumerate(packet.get('pre', packet).get('recent_learning', [])):
-        yield f'{prefix}/recent_learning/{i}', row
+    recent = packet.get('pre', packet)
+    if 'recent_learning' in recent:
+        yield f'{prefix}/recent_learning', recent, 'recent_learning'
     for slot, record in packet.get('primary', {}).items():
-        for i, row in enumerate(record.get('evaluation', [])):
-            yield f'/primary/{slot}/evaluation/{i}', row
+        if 'evaluation' in record:
+            yield f'/primary/{slot}/evaluation', record, 'evaluation'
+
+
+def _public_rows(packet):
+    for path, record, field in _public_row_groups(packet):
+        for i, row in enumerate(record[field]):
+            yield f'{path}/{i}', row
+
+
+def _tabulate_public_rows(packet):
+    packet['episode_table_format'] = PUBLIC_EPISODE_TABLE
+    for _, record, field in _public_row_groups(packet):
+        layouts = {}
+        encoded = []
+        rows = record[field]
+        # One invalid candidate can produce the same detailed error on every task.
+        # Keep one full copy of each such error and bind each affected row to it.
+        errors = [row['candidate_error'] for row in rows if 'candidate_error' in row]
+        unique = {dumps(error): error for error in errors}
+        share_errors = len(unique) < len(errors)
+        indices = {key: i for i, key in enumerate(unique)} if share_errors else {}
+        for row in rows:
+            if share_errors and 'candidate_error' in row:
+                row = dict(row)
+                row['candidate_error_index'] = indices[dumps(row.pop('candidate_error'))]
+            columns = tuple(sorted(row))
+            index = layouts.setdefault(columns, len(layouts))
+            encoded.append([index, *(row[column] for column in columns)])
+        record[field] = dict(columns=[list(columns) for columns in layouts], rows=encoded)
+        if share_errors:
+            record[field]['candidate_errors'] = list(unique.values())
+
+
+def _share_public_series(packet):
+    """Transpose episode tables and intern exact column sequences across arms."""
+    series, index = [], {}
+    def reference(values):
+        key = dumps(values)
+        if key not in index:
+            index[key] = len(series)
+            if values and all(dumps(v) == dumps(values[0]) for v in values):
+                encoded = {'constant': values[0], 'length': len(values)}
+            elif values and all(type(v) is type(values[0]) and type(v) in (int, float)
+                                and v in (0, 1) for v in values):
+                encoded = {'binary': ''.join(str(int(v)) for v in values), 'float': type(values[0]) is float}
+            else:
+                encoded = values
+            series.append(encoded)
+        return index[key]
+
+    for _, record, field in _public_row_groups(packet):
+        table = record[field]
+        rows = table.pop('rows')
+        table['row_groups'] = reference([r[0] for r in rows])
+        table['column_series'] = [[reference([r[i] for r in rows if r[0] == layout])
+                                   for i in range(1, len(columns) + 1)]
+                                  for layout, columns in enumerate(table['columns'])]
+    packet['episode_series'] = series
+    packet['episode_series_format'] = ('row_groups and column_series index episode_series. The nth occurrence of '
+                                       'a group reads its nth value in each column. Constants repeat length times; '
+                                       'binary strings store one score per character.')
+
+
+def _restore_public_series(view):
+    series = view.pop('episode_series')
+    del view['episode_series_format']
+    def values(ref):
+        if type(ref) is not int or not 0 <= ref < len(series):
+            raise ValueError('Invalid public column series reference')
+        data = series[ref]
+        if isinstance(data, list):
+            return data
+        if set(data) == {'constant', 'length'} and type(data['length']) is int and data['length'] >= 0:
+            return [data['constant']] * data['length']
+        if set(data) == {'binary', 'float'} and type(data['float']) is bool and set(data['binary']) <= {'0', '1'}:
+            cast = float if data['float'] else int
+            return [cast(c) for c in data['binary']]
+        raise ValueError('Invalid public column encoding')
+
+    for _, record, name in _public_row_groups(view):
+        table = record[name]
+        gids = values(table.pop('row_groups'))
+        groups = table.pop('column_series')
+        if len(groups) != len(table['columns']):
+            raise ValueError('Column series does not match its schemas')
+        positions = [0] * len(groups)
+        columns = [[values(ref) for ref in group] for group in groups]
+        rows = []
+        for gid in gids:
+            if type(gid) is not int or not 0 <= gid < len(groups):
+                raise ValueError('Invalid public row schema')
+            pos = positions[gid]
+            rows.append([gid, *(col[pos] for col in columns[gid])])
+            positions[gid] += 1
+        if any(len(col) != positions[g] for g, group in enumerate(columns) for col in group):
+            raise ValueError('Wrong public column length')
+        table['rows'] = rows
+
+
+def _expand_public_rows(packet):
+    """Read the compact tables without altering the shared wire packet."""
+    if 'episode_table_format' not in packet:
+        return packet
+    if packet['episode_table_format'] != PUBLIC_EPISODE_TABLE or not packet.get('compact_episode_refs'):
+        raise ValueError('Unrecognized public episode table format')
+    view = deepcopy(packet)
+    if 'episode_series' in view:
+        _restore_public_series(view)
+    del view['episode_table_format']
+    view.pop('episode_shared_values', None)
+    view.pop('episode_shared_format', None)
+    for _, record, field in _public_row_groups(view):
+        table = record[field]
+        if not isinstance(table, dict) or set(table) not in (
+                {'columns', 'rows'}, {'columns', 'rows', 'candidate_errors'}):
+            raise ValueError('Public episode table lacks columns or rows')
+        layouts = table['columns']
+        if any(columns != sorted(set(columns)) for columns in layouts):
+            raise ValueError('Public episode table columns are ambiguous')
+        decoded = []
+        for index, *values in table['rows']:
+            if type(index) is not int or not 0 <= index < len(layouts) or len(values) != len(layouts[index]):
+                raise ValueError('Public episode table row does not match its columns')
+            row = dict(zip(layouts[index], values, strict=True))
+            for column, glossary in packet.get('episode_shared_values', {}).items():
+                ref = row.get(column)
+                if type(ref) is int:
+                    if not 0 <= ref < len(glossary):
+                        raise ValueError('Invalid shared episode value index')
+                    row[column] = glossary[ref]
+            if 'candidate_error_index' in row:
+                ref = row.pop('candidate_error_index')
+                errors = table.get('candidate_errors')
+                if (not isinstance(errors, list) or type(ref) is not int or not 0 <= ref < len(errors)
+                        or 'candidate_error' in row or not isinstance(errors[ref], dict)):
+                    raise ValueError('Invalid public candidate error reference')
+                row['candidate_error'] = deepcopy(errors[ref])
+            decoded.append(row)
+        record[field] = decoded
+    return view
 
 
 def _policy_evidence(packet):
@@ -157,7 +299,9 @@ def _policy_evidence(packet):
     slots = packet.get('primary', {})
     if not slots:
         return packet
-    view = deepcopy(packet)
+    view = _expand_public_rows(packet)
+    if view is packet:
+        view = deepcopy(packet)
     slots = view['primary']
     rows = list(_public_rows(view))
     # Build from direct fields before resolving anything. A reference can never
@@ -203,11 +347,12 @@ def _visible_row(row):
                                 'phase', 'episode_hash', 'evidence') if k in row}
 
 
-def _review_witness_index(evidence):
+def _review_witness_index(evidence, *, group_learning=False):
     """Bind excerpts to their episode rows and share identical receipts across candidate slots."""
     witnesses = {}
     groups = []
-    for item in evidence.values():
+    learning_witnesses = []
+    for evidence_id, item in evidence.items():
         if not isinstance(item, dict):
             continue
         rows = [item] if 'task_id' in item else item.get('evaluation', [])
@@ -222,11 +367,61 @@ def _review_witness_index(evidence):
             facts['review_witness_ref'] = ref
             witnesses[ref] = witness
             group.append(ref)
-        if group:
+        if group_learning and evidence_id.startswith('learning.'):
+            learning_witnesses.extend(group)
+        elif group:
             groups.append(group)
+    if learning_witnesses:
+        # Give the most recent learning rows and every candidate a chance to
+        # display whole action/feedback witnesses under the same fixed budget.
+        groups.insert(0, list(reversed(learning_witnesses)))
     # If the full set exceeds context, retain whole witnesses across arms in task order.
     order = dict.fromkeys(ref for batch in zip_longest(*groups) for ref in batch if ref is not None)
     return {ref: witnesses[ref] for ref in order}
+
+
+def _compact_review_evidence(evidence, layout, witness_keys=None):
+    """Keep ordered outcomes and attribution when full episode prose cannot fit."""
+    if layout not in ('compact_v1', 'core_v1', 'table_v1'):
+        raise ValueError('Unknown Reviewer context layout')
+    result = deepcopy(evidence)
+    fields = {'task_id', 'score', 'native_score', 'status', 'gate_source', 'historical_learning'}
+    for record in result.values():
+        if not isinstance(record, dict):
+            continue
+        if layout in ('core_v1', 'table_v1'):
+            if 'source' in record:
+                record['source_omitted_hash'] = digest(record.pop('source'))
+            if 'last_unscored_draft' in record:
+                record['last_unscored_draft_hash'] = digest(record.pop('last_unscored_draft'))
+        rows = [record] if 'task_id' in record else record.get('evaluation', [])
+        for row in rows:
+            reference = row.get('evidence', {}).get('review_witness_ref')
+            allowed = fields | ({'program_hash'} if row is record else set())
+            for key in tuple(row):
+                if key not in allowed:
+                    del row[key]
+            if reference:
+                row['evidence'] = {'review_witness_ref': witness_keys.get(reference, reference)
+                                   if witness_keys is not None else reference}
+        if layout == 'table_v1' and 'evaluation' in record:
+            columns = ('task_id', 'score', 'native_score', 'status', 'gate_source', 'historical_learning')
+            record['evaluation_columns'] = [*columns, 'review_witness_ref']
+            record['evaluation'] = [[*(row.get(field) for field in columns),
+                                     row.get('evidence', {}).get('review_witness_ref')] for row in rows]
+    return result
+
+
+def _review_layout(evidence, witnesses, layout):
+    if not layout:
+        return evidence, witnesses
+    refs = None
+    if layout == 'table_v1':
+        prefixes = [reference[:16] for reference in witnesses]
+        if len(set(prefixes)) == len(prefixes):
+            refs = dict(zip(witnesses, prefixes, strict=True))
+    displayed = _compact_review_evidence(evidence, layout, refs)
+    return displayed, {refs[key]: value for key, value in witnesses.items()} if refs else witnesses
 
 
 def _messages(system, body):
@@ -296,7 +491,7 @@ def _compact_experiences(events, tokens):
             lines = mod.get('diff_excerpt', [])
             fragments = [s for line in lines if (s := _safe_diff_line(line))]
             record = {k: mod[k] for k in ('slot', 'slot_ref', 'parent_hash', 'draft_hash', 'diff_hash',
-                      'evaluation_key', 'success_count', 'task_count') if k in mod}
+                      'evaluation_key', 'success_count', 'task_count', 'family_outcomes') if k in mod}
             record.update(batch_hash=archive, scope='alfworld', observed_error=_error(mod.get('error')),
                           reviewer_judgments=opinions, partial_code_fragments=fragments,
                           undisplayed_lines=mod.get('omitted_lines', 0) + len(lines) - len(fragments),
@@ -338,6 +533,8 @@ def _review_findings(response, evidence):
 
 
 def _displayed_hash(body):
+    if 'evidence_layout' in body:
+        return digest({k:v for k,v in body.items() if k != 'format_correction'})
     if 'episode_witnesses' not in body:
         return digest(body['evidence'])
     return digest({k: body[k] for k in ('evidence', 'episode_witnesses', 'omitted_witness_count')})
@@ -355,11 +552,14 @@ def _format(role, user):
         finding = obj(dict(evidence_ids=ids, judgment=dict(type='string', enum=sorted(FINDING_KINDS)),
                            observation=string))
         schema = obj(dict(findings=dict(type='array', minItems=1, maxItems=8, items=finding)))
-    elif role == 'decide':
+    elif role in {'decide', 'reviewer_decide'}:
+        component = 'diagnose' if role == 'reviewer_decide' else 'propose'
         ids = citations(user['public_evidence']['evidence_ids'])
         schema = obj(dict(should_update=dict(type='boolean'), reason=string, evidence_ids=ids,
-                          target_components=dict(type='array', maxItems=1, items=dict(type='string', enum=['propose'])),
+                          target_components=dict(type='array', maxItems=1, items=dict(type='string', enum=[component])),
                           expected_effect=string))
+    elif role == 'reviewer_revise':
+        schema = obj(dict(prompt=string))
     elif role == 'revise':
         schema = obj(dict(code=string, prompt=string))
     else:
@@ -373,10 +573,12 @@ class Roles:
     An injected transport is a callable taking an OpenAI-compatible JSON request
     and returning its decoded response. The default client only accepts loopback.
     """
+    role_settings = ROLE_SETTINGS
+
     def __init__(self, root, model_config, *, tokenizer=None, transport=None):
         self.root = Path(root) / 'roles'
         self.config = dict(model_config)
-        self.tokens = tokenizer or Tokenizer(self.config['tokenizer_path'])
+        self.tokens = tokenizer or Tokenizer(self.config['tokenizer_path'], model_name=self.config['model_name'])
         self.model = self.config['model_name']
         self.identity = self.config['model_fingerprint']
         self.context = int(self.config['context_tokens'])
@@ -404,13 +606,19 @@ class Roles:
 
     def _call(self, role, system, user, seed, *, policy_hash=None):
         messages = _messages(system, user)
-        temp, limit = ROLE_SETTINGS[role]
+        temp, limit = self.role_settings[role]
         n = self.tokens.chat_count(messages)
         if n + limit > self.context:
             raise ValueError(f'{role} input requires {n} tokens with {limit} reserved; limit {self.context}')
         request = dict(model=self.model, messages=messages, temperature=temp, top_p=1, max_tokens=limit,
                        seed=seed, response_format=_format(role, user),
                        chat_template_kwargs={'enable_thinking': False})
+        # The registered Qwen27B service decodes its role schema from the first output token.
+        if self.model == 'qwen3.8-27b-local' or 'include_reasoning' in self.config:
+            include_reasoning = self.config.get('include_reasoning', False)
+            if type(include_reasoning) is not bool:
+                raise ValueError('include_reasoning must be boolean')
+            request['include_reasoning'] = include_reasoning
         public = user.get('public_evidence')
         public_hash = digest(public) if public is not None else None
         key = digest(dict(role=role, job=self._job, model_fingerprint=self.identity, policy_hash=policy_hash, request=request))
@@ -458,25 +666,53 @@ class Roles:
             raise ReviewOutputError(str(exc), draft=receipt) from exc
         return decoded, public_hash
 
-    def _review(self, role, evidence, correction=None):
+    def _review(self, role, evidence, correction=None, *, focus=None, policy_hash=None):
         system = DIAGNOSE + '\n' + REVIEW_RUBRIC.partition('\nVerdicts:')[0]
-        evidence = deepcopy(evidence)
-        witnesses = _review_witness_index(evidence)
-        body = {'evidence': evidence}
-        limit = self.context - ROLE_SETTINGS[role][1]
+        limit = self.context - self.role_settings[role][1]
+        if focus is not None:
+            # Old and new reviewers must see the identical evidence window.
+            limit -= 768
         # Meta feedback can be corrected once against the identical displayed
         # evidence. Reserve the bounded correction receipt on both attempts.
         if 'meta.retained' in evidence:
             limit -= 1024
-        if witnesses:
-            items = list(witnesses.items())
+        if getattr(self, 'mixed_families', False):
+            system += '\n' + self.mixed_review_instruction
+            body, shown_witnesses = self.mixed_review_view(evidence)
+        else:
+            evidence = deepcopy(evidence)
+            witnesses = _review_witness_index(evidence, group_learning=focus is not None)
+            shown_witnesses = witnesses
+            body = {'evidence': evidence}
+            if self.tokens.chat_count(_messages(system, body)) > limit:
+                original_hash = digest(evidence)
+                for layout in ('compact_v1', 'core_v1', 'table_v1'):
+                    view, shown_witnesses = _review_layout(evidence, witnesses, layout)
+                    body = dict(evidence=view,
+                                evidence_layout=layout, evidence_source_hash=original_hash)
+                    if self.tokens.chat_count(_messages(system, body)) <= limit:
+                        break
+            if focus is not None and self.tokens.chat_count(_messages(system, body)) > limit:
+                body, shown_witnesses = self.compact_diagnosis_ledger(evidence, witnesses)
+        if shown_witnesses:
+            items = list(shown_witnesses.items())
             def show(count):
                 body['episode_witnesses'] = dict(items[:count])
                 body['omitted_witness_count'] = len(items) - count
 
-            show(len(items))
+            high = len(items)
+            if getattr(self, 'mixed_families', False):
+                # Tokenize only enough verified transitions to fill the window;
+                # a ten-round mixed ledger may contain thousands of witnesses.
+                high = min(6, len(items))
+                while high < len(items):
+                    show(high)
+                    if self.tokens.chat_count(_messages(system, body)) > limit:
+                        break
+                    high = min(2 * high, len(items))
+            show(high)
             if self.tokens.chat_count(_messages(system, body)) > limit:
-                low, high = 0, len(items)
+                low = 0
                 while low < high:
                     count = (low + high + 1) // 2
                     show(count)
@@ -493,10 +729,20 @@ class Roles:
             if receipt['displayed_evidence_hash'] != evidence_hash:
                 raise ValueError('A format correction must use the original displayed Reviewer evidence')
             body['format_correction'] = correction
-        response, _ = self._call(role, system, body, self.seed)
-        return dict(findings=response['findings'], evidence_hash=evidence_hash)
+        if focus:
+            system += ('\nDiagnostic focus for this search, subordinate to the fixed evidence and '
+                       'reporting rules above:\n' + focus)
+        response, _ = self._call(role, system, body, self.seed, policy_hash=policy_hash)
+        result = dict(findings=response['findings'], evidence_hash=evidence_hash)
+        if policy_hash is not None:
+            result['reviewer_policy_hash'] = policy_hash
+        return result
 
     def diagnose(self, mechanism, memory, ledger, history):
+        return self._review('diagnose', self._diagnosis_evidence(mechanism, memory, ledger))
+
+    @staticmethod
+    def _diagnosis_evidence(mechanism, memory, ledger):
         program_hash = Program(mechanism).hash
         evidence = {'parent.source': mechanism, 'parent.memory': {
             'program_hash': program_hash, 'snapshot_hash': digest(memory),
@@ -504,7 +750,7 @@ class Roles:
         for index, row in enumerate(ledger):
             if row.get('program_hash') == program_hash:
                 evidence[f'learning.{index}'] = dict(_visible_row(row), program_hash=program_hash)
-        return self._review('diagnose', evidence)
+        return evidence
 
     def review(self, mechanism, records):
         return self._review_records(mechanism, records)
@@ -569,6 +815,7 @@ class Roles:
         # Keep repeated code and episode evidence readable at one stable JSON
         # pointer. Every candidate retains its own ordered outcomes and archive IDs.
         rows = list(_public_rows(packet))
+        original_facts = {path: row['evidence'] for path, row in rows if isinstance(row.get('evidence'), dict)}
         sources, witnesses = {}, {}
         primary = packet.get('primary', {})
         for slot, record in primary.items():
@@ -609,6 +856,50 @@ class Roles:
                     row['full_witness_hash'] = fingerprint
         if reduced:
             packet['omission'] = {'episode_witnesses_reduced': len(reduced), 'witnesses_hash': digest(reduced)}
+        if self.tokens.count(dumps(packet)) > limit:
+            archived = []
+            for path, row in rows:
+                facts = original_facts.get(path)
+                if facts:
+                    fingerprint = digest(facts)
+                    archived.append([path, fingerprint])
+                    row.pop('evidence_ref', None)
+                    row['evidence'] = {}
+                    if not row.get('episode_hash'):
+                        row['full_witness_hash'] = fingerprint
+            if archived:
+                packet['omission'] = {'episode_witnesses_reduced': len(archived),
+                                      'witnesses_hash': digest(archived), 'layout': 'archive_refs_v1'}
+        if self.tokens.count(dumps(packet)) > limit:
+            # Receipt hashes remain full length in the sealed evaluation. Use
+            # short displayed prefixes and retain each task and score on wire.
+            core = {'task_id', 'score', 'native_score', 'status', 'gate_source',
+                    'candidate_error', 'evidence', 'full_witness_hash', 'episode_hash_prefix'}
+            if getattr(self, 'mixed_families', False):
+                core.add('family')
+            for _, row in rows:
+                full_hash = row.pop('episode_hash', None)
+                if full_hash:
+                    row['episode_hash_prefix'] = full_hash[:16]
+                for key in tuple(row):
+                    if key not in core:
+                        del row[key]
+            packet['compact_episode_refs'] = True
+        if packet.get('phase') == 'post_primary' and self.tokens.count(dumps(packet)) > limit:
+            _tabulate_public_rows(packet)
+        if ('episode_table_format' in packet and self.tokens.count(dumps(packet)) > limit
+                and hasattr(self, 'share_episode_values')):
+            self.share_episode_values(packet)
+        if (getattr(self, 'mixed_families', False) and 'episode_shared_values' in packet
+                and self.tokens.count(dumps(packet)) > limit):
+            _share_public_series(packet)
+        # A mixed post-primary packet has four independent 60-episode tables.
+        # Preserve the same evidence and encoding when those tables just exceed
+        # the ordinary budget. Leave space for policy, source, repair, and the
+        # largest response. _call still checks the actual rendered prompt.
+        if getattr(self, 'mixed_families', False) and packet.get('phase') == 'post_primary':
+            reserved = max(settings[1] for settings in self.role_settings.values()) + 5120
+            limit = max(limit, min(limit + 3072, self.context - reserved))
         if self.tokens.count(dumps(packet)) > limit:
             raise ValueError('Mandatory public evidence exceeds registered joint token limit')
         return packet
@@ -664,11 +955,22 @@ class Roles:
             policy_instruction(updated, packet, repairing)
         return updated
 
-    def propose(self, evolver, mechanism, packet, seed, previous, error):
-        strategy = policy_instruction(evolver, packet, error is not None)
+    def propose(self, evolver, mechanism, packet, seed, previous, error, *, proposal_slot=None):
+        policy_input = packet if proposal_slot is None else dict(packet, role_phase='propose', proposal_slot=proposal_slot)
+        strategy = policy_instruction(evolver, policy_input, error is not None)
         system = '\n'.join([AUTHOR, HOOK_INTERFACE_PROMPT, LANGUAGE_RULES_PROMPT,
                             evolver['propose']['prompt'], strategy])
+        if getattr(self, 'mixed_families', False):
+            system += '\n' + self.mixed_review_instruction
+        if proposal_slot is not None:
+            location = ('pre.diagnosis' if packet.get('diagnosis_phase') == 'post_primary' else 'diagnosis')
+            system += (f'\nUse your branch Reviewer findings in public_evidence.{location} when designing this '
+                       'candidate. Test a hypothesis supported by the observations, accounting for uncertainty. '
+                       'Your slot number permits complementary tests when the evidence warrants them.')
+
         user = dict(current_source=mechanism, public_evidence=packet, event_contract=EVENT_CONTRACT)
+        if proposal_slot is not None:
+            user['proposal_slot'] = proposal_slot
         if self.config.get('model_catalog'):
             user['available_models'] = self.config['model_catalog']
         if error is not None:

@@ -41,6 +41,15 @@ exclude = ["tests*"]
 
 [tool.pytest.ini_options]
 testpaths = [
+  "tests/test_coevolution_panel.py",
+  "tests/test_mixed_panel.py",
+  "tests/test_coevolution_mixed_native.py",
+  "tests/test_rsi_mixed_roles.py",
+  "tests/test_coevolution_workflow.py",
+  "tests/test_rsi_coevolution_roles.py",
+  "tests/test_coevolution_selection.py",
+  "tests/test_coevolution_campaign.py",
+  "tests/test_coevolution_queue.py",
   "tests/test_rsi_panel.py",
   "tests/test_rsi_family_panel.py",
   "tests/test_rsi_family_workflow.py",

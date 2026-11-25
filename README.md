@@ -1,13 +1,16 @@
 # EvoMemory
 
+本目录包含基于 v3 并行评测版本的 **Reviewer 与 Evolver 协同进化初试**。Reviewer 负责诊断，Evolver 负责把诊断变为可测试的记忆机制。两者独立判断是否修订，统一通过环境实测决定是否采纳。六类 ALFWorld 任务共享机制、诊断策略、提案策略及进化历史，每类独立维护任务记忆。十轮混合进化、四组选优与独立 100 题终测见[实验协议](docs/coevolution_pilot.md)。
+
 **Evolving agent memory mechanisms with structured experience from earlier mechanism changes.**
 
 EvoMemory evolves the program that supplies memory to a fixed Executor. A
-fixed Reviewer diagnoses observed behavior. Evolution Memory stores evidence
+Reviewer diagnoses observed behavior. Evolution Memory stores evidence
 from earlier edits for subsequent proposals.
 
 | Workflow | Entry point | What can change |
 |---|---|---|
+| [Six-family v4 campaign](docs/coevolution_pilot.md) | `python -m rsi_paired prepare-coevolution --protocol mixed-10x60` | Shared Task Memory program and independently revisable Reviewer and Evolver strategies |
 | Online task stream | `python -m math_apps_online` | The Task Memory program, with feedback on the same task |
 | ALMA campaign | `python -m phase1_codegen` | The Task Memory program across a registered campaign |
 | [Paired proposal-policy search](docs/rsi_paired.md) | `python -m rsi_paired` | The Task Memory program and the Evolver's proposal policy |
@@ -54,7 +57,7 @@ Use **Linux and Python 3.10 or 3.11**. The isolation layer requires `libseccomp`
 there is no unrestricted execution fallback.
 
 ```bash
-git clone --branch rsi-original-parent-paired-v3 https://github.com/mingbo-yang/EvoMemory.git
+git clone --branch v4 https://github.com/mingbo-yang/EvoMemory.git
 cd EvoMemory
 python3.10 -m venv .venv
 source .venv/bin/activate

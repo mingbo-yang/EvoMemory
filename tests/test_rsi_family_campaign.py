@@ -1,11 +1,12 @@
 """Sequential orchestration and evidence boundaries using synthetic adapters, without a model."""
 from contextlib import contextmanager
 from copy import deepcopy
+from threading import Barrier
 
 import pytest
 
 from rsi_paired import campaign, family_campaign as families
-from rsi_paired.panel import save_registration
+from rsi_paired.panel import HISTORICAL_SEQUENTIAL_PROTOCOL, SEQUENTIAL_PROTOCOL, save_registration
 from rsi_paired.workflow import _read, _write, digest
 from tests.test_rsi_family_panel import archives, manifest  # shared synthetic official-layout fixtures
 from tests.test_rsi_roles import roles
@@ -42,11 +43,28 @@ class FixtureWireAudit:
         assert bank == {} and [row['task_id'] for row in outcomes] == [t['id'] for t in tasks]
 
 
-def test_identical_final_frameworks_really_execute_twice_and_resume(tmp_path, monkeypatch):
+class ParallelPanelAdapter(PanelAdapter):
+    candidate_workers = 2
+
+    def __init__(self):
+        super().__init__()
+        self.both_arms_started = Barrier(2)
+
+    def evaluate_isolated(self, job, source, bank, tasks, seeds):
+        self.both_arms_started.wait(timeout=10)
+        worker = PanelAdapter()
+        worker.set_job(job)
+        result = worker.evaluate(source, bank, tasks, seeds)
+        self.calls.extend(worker.calls)
+        return result
+
+
+@pytest.mark.parametrize("adapter_class", [PanelAdapter, ParallelPanelAdapter])
+def test_identical_final_frameworks_really_execute_twice_and_resume(tmp_path, monkeypatch, adapter_class):
     monkeypatch.setattr(campaign, 'Audit', FixtureWireAudit)
     states = [{'mechanism': 'same', 'evolver': 'same'}] * 2
     tasks = [dict(id=str(i), family='simple', split='valid_seen', group_id=f'room-{i % 5}') for i in range(100)]
-    adapter = PanelAdapter()
+    adapter = adapter_class()
     results, _ = campaign._native_panel(tmp_path, adapter, states, tasks, 33, arms=families.ARMS)
     assert len(adapter.calls) == 2 and adapter.calls[0][0] != adapter.calls[1][0]
     assert adapter.calls[0][1:] == adapter.calls[1][1:]
@@ -76,7 +94,9 @@ def test_only_compact_evolution_history_can_be_retrieved_in_second_family(tmp_pa
     assert len(list((r.root / 'retrieval').glob('*.json'))) == 1
 
 
-def test_two_complete_families_and_only_development_experiences_cross(tmp_path, manifest, monkeypatch):
+@pytest.mark.parametrize("protocol", [SEQUENTIAL_PROTOCOL, HISTORICAL_SEQUENTIAL_PROTOCOL])
+def test_two_complete_families_and_only_development_experiences_cross(tmp_path, manifest, monkeypatch, protocol):
+    manifest = dict(manifest, protocol=protocol)
     cfg = {'model': 'synthetic'}
     root = tmp_path / 'output'
     mp, cp = tmp_path / 'plan.json', tmp_path / 'model.json'
@@ -105,8 +125,9 @@ def test_two_complete_families_and_only_development_experiences_cross(tmp_path, 
         if path.name == 'final':
             final_calls.append(adapter.calls)
 
-    def batch_fake(path, *, state, panels, adapter, learning_history_tasks, seed, budget):
+    def batch_fake(path, *, state, panels, adapter, learning_history_tasks, seed, budget, protocol):
         family = path.parent.parent.name
+        assert protocol == manifest["protocol"]
         assert budget == {'episodes': 390, 'infrastructure_attempts': 2}
         assert len(panels['learning']) == 30
         assert [t['id'] for t in learning_history_tasks] == [r['task_id'] for r in state['ledger']]

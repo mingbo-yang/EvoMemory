@@ -16,7 +16,7 @@ import time
 import zipfile
 
 from evomem.common import ROOT, digest, file_hash, read, write
-from evomem.alma_backend import ACTOR_PARAMETERS
+from evomem.alma_backend import ACTOR_PARAMETERS, ALFWORLD_ACTOR_PARAMETERS
 from .tokenization import Tokenizer
 from .engine import EvolutionEngine, code_binding
 from .experience import EvolutionMemory
@@ -29,6 +29,7 @@ from .store import RunStore
 from .capabilities import LocalModelCapabilities
 
 ENDPOINTS = {'alfworld': 'http://127.0.0.1:8140/v1', 'textworld': 'http://127.0.0.1:8142/v1'}
+ACTOR_PARAMETERS_BY_ENVIRONMENT = {'alfworld': ALFWORLD_ACTOR_PARAMETERS, 'textworld': ACTOR_PARAMETERS}
 ROUNDS = 3
 
 
@@ -217,7 +218,7 @@ def collection(root, environment, tokenizer, model_hash):
         own_names += ['textworld_native.py', 'textworld_tasks.py', 'local_service.py']
     binding = dict(version='real-no-memory-collection-v1', environment=environment,
                    tasks=selected, model_hash=model_hash, endpoint=ENDPOINTS[environment],
-                   actor_parameters=ACTOR_PARAMETERS,
+                   actor_parameters=ACTOR_PARAMETERS_BY_ENVIRONMENT[environment],
                    own_code={name: file_hash(Path(__file__).with_name(name)) for name in own_names},
                    executor_bridge=file_hash(ROOT / 'evomem/alma_backend.py'))
     reuse_path = out / 'reuse.json'
@@ -275,7 +276,7 @@ def adaptation(root, environment, role):
         original_binding = read(folder / 'binding.json')
         if (original_binding['environment'] != environment
                 or original_binding['endpoint'] != ENDPOINTS[environment]
-                or original_binding['actor_parameters'] != ACTOR_PARAMETERS
+                or original_binding['actor_parameters'] != ACTOR_PARAMETERS_BY_ENVIRONMENT[environment]
                 or original_binding['tasks'][role + '_adaptation'] != expected):
             raise RuntimeError('Original collection protocol does not match this environment and split')
         # Verify preserved code bytes instead of pretending the old recordings
@@ -371,7 +372,7 @@ def target_memory_checkpoint(root, environment, tokenizer, capabilities):
 def freeze_search(out, plan, model_hash):
     hashes = code_binding()
     freeze = dict(version=WORKFLOW_VERSION, plan=plan, model_hash=model_hash,
-                  source_hashes=hashes, python=sys.version, actor_parameters=ACTOR_PARAMETERS,
+                  source_hashes=hashes, python=sys.version, actor_parameters=ACTOR_PARAMETERS_BY_ENVIRONMENT,
                   evolver_prompt=EVOLVER_PROMPT, evolver_parameters=EVOLVER_PARAMETERS,
                   evolver_abi=HOOK_VERSION,
                   reviewer_prompt=REVIEW_PROMPT, reviewer_parameters=REVIEW_PARAMETERS,

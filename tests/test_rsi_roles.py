@@ -217,3 +217,21 @@ def test_repair_keeps_malformed_output_and_does_not_send_unbound_evidence(tmp_pa
     shown = r.compress(packet)
     assert shown['primary']['P1']['last_unscored_draft'] == 'bad 2'
     assert shown['primary']['P1']['drafts'][0]['error'] == 'E1'
+
+
+@pytest.mark.parametrize('model,expected', [('qwen3.8-27b-local', {'include_reasoning': False}),
+                                           ('gemma4-31b', {}), ('qwen3.5-9b', {}), ('GLM-4.7-Flash', {})])
+def test_structured_role_request_matches_registered_model_options(tmp_path, model, expected):
+    calls = []
+    def transport(request):
+        calls.append(request)
+        return {'model': model, 'choices': [{'finish_reason': 'stop', 'message': {
+            'content': json.dumps({'source': BASELINE_SOURCE})}}]}
+
+    caller = Roles(tmp_path, {'model_name': model, 'model_fingerprint': 'cpu', 'context_tokens': 32768},
+                   tokenizer=Tokens(), transport=transport)
+    caller._call('propose', 'Test', {}, 42)
+    request, = calls
+    assert request['chat_template_kwargs'] == {'enable_thinking': False}
+    assert {key: request[key] for key in ('include_reasoning',) if key in request} == expected
+    assert request['response_format']['type'] == 'json_schema'

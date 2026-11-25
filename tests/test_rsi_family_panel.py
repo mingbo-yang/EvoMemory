@@ -52,6 +52,7 @@ def test_static_panel_complete_groups_and_content_isolation(manifest, archives):
         assert plan["final_by_official_split"] == {"valid_unseen": 18, "valid_seen": 22, "train": 60}
         dev = learning + reserves
         assert {t["group_id"] for t in dev}.isdisjoint(t["group_id"] for t in plan["final"])
+        assert len({t["id"] for t in dev + plan["final"]}) == 640
         assert len({t["game_sha256"] for t in dev + plan["final"]}) == 640
         assert all(t["family"] == family and t["room"] not in (0, 1000, 2100) for t in dev)
     first = manifest["families"]["simple"]["final"][0]
@@ -85,6 +86,18 @@ def _learning_rows(tasks, labels):
             for task, score in zip(tasks, labels, strict=True)]
 
 
+def test_fresh_gates_use_only_their_registered_order_independent_of_learning(manifest):
+    first, current = manifest["families"]["two"]["batches"][:2]
+    learned = first["learning"] + current["learning"]
+    for seed, scores in [(19, [0] * 60), (63, [1] * 60), (19, [0, 1] * 30)]:
+        resolved = panel.resolve_family_panels(current, learned, _learning_rows(learned, scores), seed)
+        assert resolved["panels"] == current
+        for gate in panel.GATES:
+            sampling = resolved["sampling"][gate]
+            assert sampling["entries"] == [{"task_id": t["id"], "source": "fresh"} for t in current[gate]]
+            assert sampling["counts"] == dict(fresh=30, historical_success=0, historical_failure=0)
+
+
 @pytest.mark.parametrize("labels,successes,failures", [
     ([0, 1] * 30, [6, 6], [6, 6]),
     ([0] * 60, [0, 0], [6, 6]),
@@ -94,8 +107,9 @@ def test_resolve_fair_disjoint_gates_and_fill_shortages(manifest, labels, succes
     first, current = manifest["families"]["simple"]["batches"][:2]
     learned = first["learning"] + current["learning"]
     ledger = _learning_rows(learned, labels)
-    result = panel.resolve_family_panels(current, learned, ledger, 63)
-    assert result == panel.resolve_family_panels(current, learned, ledger, 63)
+    result = panel.resolve_family_panels(current, learned, ledger, 63, protocol=panel.HISTORICAL_SEQUENTIAL_PROTOCOL)
+    assert result == panel.resolve_family_panels(current, learned, ledger, 63,
+                                                 protocol=panel.HISTORICAL_SEQUENTIAL_PROTOCOL)
     assert sorted(v["counts"]["historical_success"] for v in result["sampling"].values()) == successes
     assert sorted(v["counts"]["historical_failure"] for v in result["sampling"].values()) == failures
     p, m = ([t["id"] for t in result["panels"][g]] for g in panel.GATES)
@@ -136,7 +150,10 @@ def test_exhausted_or_inseparable_training_pools_fail_before_execution():
 
 
 def test_v3_budget_and_two_fresh_reserves_are_preregistered(manifest):
-    assert manifest["protocol"] == panel.SEQUENTIAL_PROTOCOL == "rsi_original_parent_paired_v3_6x30"
+    assert manifest["protocol"] == panel.SEQUENTIAL_PROTOCOL == "rsi_original_parent_paired_v3_6x30_fresh"
+    historical = dict(manifest, protocol="rsi_original_parent_paired_v3_6x30")
+    assert historical["protocol"] == panel.HISTORICAL_SEQUENTIAL_PROTOCOL
+    panel.validate_sequential_manifest(historical)
     assert manifest["budget"] == {
         "per_round": {"episodes": 390, "infrastructure_attempts": 2},
         "final_per_family": 200, "max_native_episodes_per_family": 2540, "max_native_episodes_total": 5080}
@@ -172,7 +189,7 @@ def test_siblings_may_fill_history_within_a_gate_but_never_across(manifest):
         group = batch[("primary", "meta")[i % 2]][0]["group_id"]
         task["group_id"] = group
     ledger = _learning_rows(history, [(i // 2) % 2 for i in range(len(history))])
-    result = panel.resolve_family_panels(batch, history, ledger, 91)
+    result = panel.resolve_family_panels(batch, history, ledger, 91, protocol=panel.HISTORICAL_SEQUENTIAL_PROTOCOL)
     primary, meta = (result["panels"][name] for name in panel.GATES)
     assert {t["group_id"] for t in primary}.isdisjoint(t["group_id"] for t in meta)
     for gate in panel.GATES:
@@ -185,7 +202,8 @@ def test_group_constrained_historical_shortfall_is_filled_without_duplicate_tria
     for task in batch["learning"]:
         task["group_id"] = "one-historical-group"
     ledger = _learning_rows(batch["learning"], [0, 1] * 15)
-    result = panel.resolve_family_panels(batch, batch["learning"], ledger, 91)
+    result = panel.resolve_family_panels(batch, batch["learning"], ledger, 91,
+                                         protocol=panel.HISTORICAL_SEQUENTIAL_PROTOCOL)
     assert sorted(s["counts"]["fresh"] for s in result["sampling"].values()) == [18, 30]
     all_rows = result["panels"]["primary"] + result["panels"]["meta"]
     assert len({t["id"] for t in all_rows}) == 60
@@ -193,4 +211,4 @@ def test_group_constrained_historical_shortfall_is_filled_without_duplicate_tria
     # Detect invalid reserves before offering them to an Evolver, even if outcomes later permit a workaround.
     batch["meta"][0]["group_id"] = batch["primary"][0]["group_id"]
     with pytest.raises(ValueError, match="overlap between primary and meta"):
-        panel.resolve_family_panels(batch, batch["learning"], ledger, 91)
+        panel.resolve_family_panels(batch, batch["learning"], ledger, 91, protocol=panel.HISTORICAL_SEQUENTIAL_PROTOCOL)

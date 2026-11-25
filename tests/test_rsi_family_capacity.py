@@ -169,3 +169,109 @@ def test_missing_meta_review_is_transferable_as_status_without_model_prose():
     assert row['review_records_hash'] == event['meta_review']['records_hash']
     assert row['reviewer_judgments'] == [] and row['success_count'] == 3
     assert 'sensitive invalid claim' not in str(row)
+
+
+def test_public_table_preserves_each_native_outcome_and_authenticates_omissions(tmp_path):
+    from rsi_paired.audit import Audit
+    from rsi_paired.roles import _expand_public_rows
+
+    packet = table(True)
+    packed = roles(tmp_path, 20000).compress(packet)
+    assert len(dumps(packed)) <= 20000
+    assert packed['omission']['layout'] == 'archive_refs_v1'
+    assert 'episode_table_format' in packed
+    expanded = _expand_public_rows(packed)
+    for slot, original in packet['primary'].items():
+        for prior, actual in zip(original['evaluation'], expanded['primary'][slot]['evaluation'], strict=True):
+            assert actual['gate_source'] == prior['gate_source']
+    audit = Audit(tmp_path)
+    audit.batch.mkdir()
+    (audit.batch / 'H_pre.json').write_text(dumps(packet['pre']))
+    audit.report['panel_sampling'] = {'primary': {'entries': [
+        {'source': row['gate_source']} for row in packet['primary']['parent']['evaluation']]}}
+    audit.family_feedback(packed, packet['primary'], [])
+    assert not audit.errors
+    table_view = packed['primary']['parent']['evaluation']
+    first = table_view['rows'][0]
+    columns = table_view['columns'][first[0]]
+    first[1 + columns.index('episode_hash_prefix')] = digest('different episode')[:16]
+    audit.family_feedback(packed, packet['primary'], [])
+    assert any('identity or native result' in error for error in audit.errors)
+
+
+def test_repeated_candidate_failures_fit_and_resolve_to_exact_errors(tmp_path):
+    from rsi_paired.roles import _expand_public_rows
+
+    packet = table(True)
+    original = packet['primary']['P1']['evaluation']
+    for i, row in enumerate(original):
+        row.update(score=0, native_score=None, status='method_eval_failure', candidate_error={
+            'message': 'synthetic rejected event ' * 15, 'error_hash': digest(i % 2)})
+    packed = roles(tmp_path, 21000).compress(packet)
+    wire = packed['primary']['P1']['evaluation']
+    assert len(wire['candidate_errors']) == 2
+    expanded = _expand_public_rows(packed)
+    for stored, actual in zip(original, expanded['primary']['P1']['evaluation'], strict=True):
+        assert actual['candidate_error'] == stored['candidate_error']
+        assert (actual['score'], actual['native_score'], actual['status']) == (0, None, 'method_eval_failure')
+    row = wire['rows'][0]
+    row[wire['columns'][row[0]].index('candidate_error_index') + 1] = -1
+    with pytest.raises(ValueError, match='candidate error reference'):
+        _expand_public_rows(packed)
+
+
+def test_compact_reviewer_request_keeps_per_task_outcomes_and_whole_witnesses(tmp_path):
+    import json
+    from rsi_paired.roles import _review_layout, _review_witness_index, _score_view
+
+    class TokenCounter(Characters):
+        def chat_count(self, messages):
+            return len(json.dumps(messages)) // 3
+
+    requests = []
+    def transport(request):
+        requests.append(request)
+        return {'model': request['model'], 'choices': [{'finish_reason': 'stop', 'message': {
+            'content': json.dumps({'findings': [{'evidence_ids': ['primary.P1'],
+                'observation': 'Synthetic result.', 'judgment': 'insufficient_evidence'}]})}}]}
+
+    reviewer = Roles(tmp_path, {'model_name': 'cpu', 'model_fingerprint': 'offline', 'context_tokens': 9000},
+                  tokenizer=TokenCounter(), transport=transport)
+    records = table(True)['primary']
+    for rec in records.values():
+        for row in rec['evaluation']:
+            row['evidence']['review_witness'] = {'text': 'complete synthetic witness ' + row['task_id']}
+    reviewer.review('parent text', records)
+    request, = requests
+    body = json.loads(request['messages'][1]['content'])
+    assert reviewer.tokens.chat_count(request['messages']) + request['max_tokens'] <= reviewer.context
+    assert body['evidence_layout'] == 'table_v1'
+    indexed = {'parent.source': 'parent text', **{'primary.' + k: _score_view(v) for k, v in records.items()}}
+    witnesses = _review_witness_index(indexed)
+    expected, abbreviated = _review_layout(indexed, witnesses, 'table_v1')
+    assert expected == body['evidence'] and digest(indexed) == body['evidence_source_hash']
+    assert all(value == abbreviated[ref] for ref, value in body['episode_witnesses'].items())
+    for slot, rec in records.items():
+        shown = body['evidence']['primary.' + slot]
+        for row, values in zip(rec['evaluation'], shown['evaluation'], strict=True):
+            decoded = dict(zip(shown['evaluation_columns'], values, strict=True))
+            assert all(decoded[key] == row[key] for key in ('task_id', 'score', 'native_score', 'status', 'gate_source'))
+
+
+def test_default_roles_count_token_ids_in_mapping_outputs(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from phase1_codegen.tokenization import Tokenizer
+
+    ids = list(range(153))
+    def render(messages, **options):
+        assert options['add_generation_prompt'] is True and options['enable_thinking'] is False
+        return {'input_ids': ids, 'attention_mask': [1] * len(ids)}
+
+    def init(tokenizer, path, *, model_name):
+        tokenizer.model_name = model_name
+        tokenizer.impl = SimpleNamespace(apply_chat_template=render)
+
+    monkeypatch.setattr(Tokenizer, '__init__', init)
+    reviewer = Roles(tmp_path, {'model_name': 'cpu', 'model_fingerprint': 'offline',
+                                'context_tokens': 32768, 'tokenizer_path': 'synthetic'}, transport=True)
+    assert reviewer.tokens.chat_count([{'role': 'user', 'content': 'A synthetic request.'}]) == len(ids)

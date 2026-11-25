@@ -11,7 +11,7 @@ from evomem.common import file_hash
 from phase1_codegen.hooks import HookSession
 from phase1_codegen.program import Program
 from rsi_paired.native import BASELINE_SOURCE, Native, _archive_episode, _evidence, _prefix, _wire
-from rsi_paired.panel import SEQUENTIAL_PROTOCOL
+from rsi_paired.panel import COEVOLUTION_6X30_PROTOCOL, COEVOLUTION_HEAT_5X23_PROTOCOL, SEQUENTIAL_PROTOCOL
 from rsi_paired.workflow import LearningMechanismError, PROTOCOL, _Journal
 from phase1_codegen.policy import Rejected
 
@@ -126,9 +126,19 @@ class NativeMemoryTests(unittest.TestCase):
         self.assertEqual(initial['cool']['value'], 8)
 
     def test_deployed_learning_hook_has_a_durable_unscored_failure_without_retry(self):
+        self.assert_learning_failure(SEQUENTIAL_PROTOCOL)
+
+    def test_six_round_coevolution_deployed_learning_failure_is_also_unscored(self):
+        self.assert_learning_failure(COEVOLUTION_6X30_PROTOCOL)
+
+    def test_heat_coevolution_deployed_learning_failure_is_also_unscored(self):
+        self.assert_learning_failure(COEVOLUTION_HEAT_5X23_PROTOCOL)
+
+    def assert_learning_failure(self, protocol):
         # The environment shell is a fixture. HookSession executes the bad
         # deployed source in the real isolated worker and produces the rejection.
-        task = dict(id='fixture', family='cool', environment='alfworld', seed=7,
+        task = dict(id='fixture', family='heat' if protocol == COEVOLUTION_HEAT_5X23_PROTOCOL else 'cool',
+                    environment='alfworld', seed=7,
                     archive_member='json_2.1.1/train/group/trial/game.tw-pddl')
         source = 'def on_event(state, event, context):\n    return state["absent"]\n'
         attempts = []
@@ -137,7 +147,7 @@ class NativeMemoryTests(unittest.TestCase):
             hook = HookSession(bank, task, allow_write)
             with self.assertRaises(Rejected) as rejected:
                 hook.emit('task_start', {'visible': {}, 'step': 0})
-            ep = dict(task_id=task['id'], environment='alfworld', family='cool', seed=seed, environment_seed=7,
+            ep = dict(task_id=task['id'], environment='alfworld', family=task['family'], seed=seed, environment_seed=7,
                       phase=phase, program_hash=bank.program.hash, memory_hash_before=bank.fingerprint,
                       memory_hash_after=bank.fingerprint, memory_hook=hook.summary(), actor_ledger_start=0,
                       actor_ledger_end=0, score=None, error=str(rejected.exception), generated_memory_write_calls=0,
@@ -146,7 +156,7 @@ class NativeMemoryTests(unittest.TestCase):
             self.native.engine.runner.ledger.with_name('canonical_episodes.jsonl').write_text(json.dumps(ep) + '\n')
             return ep
         self.native.engine.runner = SimpleNamespace(episode=run)
-        self.native.protocol = SEQUENTIAL_PROTOCOL
+        self.native.protocol = protocol
         journal = _Journal(self.native.root / 'batch', self.native, 2)
         for _ in range(2):
             with self.assertRaises(LearningMechanismError) as failure:

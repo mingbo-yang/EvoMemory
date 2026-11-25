@@ -14,7 +14,7 @@ import os
 from pathlib import Path
 import sys
 
-from evomem.alma_backend import ACTOR_PARAMETERS, ALMARunner, experience
+from evomem.alma_backend import ALFWORLD_ACTOR_PARAMETERS, ALMARunner, experience
 from evomem.common import BASE_URL, MODEL_NAME, ROOT, RUN as OLD, append, digest, file_hash, write
 from .outcomes import reported_score
 from .memory import CodeMemory
@@ -318,7 +318,7 @@ class NativeEvaluator:
         own_files = ['native.py', 'program.py', 'policy.py', 'worker.py', 'memory.py', 'hooks.py', 'hook_adapter.py', 'protocol.py']
         provenance = dict(
             environment='alfworld',
-            actor_parameters=ACTOR_PARAMETERS,
+            actor_parameters=ALFWORLD_ACTOR_PARAMETERS,
             model_fingerprint=model_fingerprint,
             model_name=model_name,
             model_endpoint=base_url,

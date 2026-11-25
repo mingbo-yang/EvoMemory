@@ -61,6 +61,7 @@ def _final_comparison(rows, tasks):
                                       native_completed=sum(e['status'] == 'completed' for e in episodes),
                                       mechanism_failures=sum(e['status'] == 'method_eval_failure' for e in episodes))
     groups, cumulative = {}, {arm: [] for arm in ARMS}
+    families = {}
     for task, a, b in zip(tasks, rows[0]['episodes'], rows[1]['episodes'], strict=True):
         group = groups.setdefault(task['group_id'], dict(tasks=0, initial_successes=0, final_successes=0))
         group['tasks'] += 1
@@ -68,11 +69,19 @@ def _final_comparison(rows, tasks):
             previous = cumulative[arm][-1] if cumulative[arm] else 0
             cumulative[arm].append(previous + row['score'])
             group[arm + '_successes'] += row['score']
-        if a['status'] != 'completed' or b['status'] != 'completed':
-            differences['without_native_pair'] += 1
-        else:
+        outcome = 'without_native_pair'
+        if a['status'] == b['status'] == 'completed':
             diff = b['native_score'] - a['native_score']
-            differences['wins' if diff > 0 else 'losses' if diff < 0 else 'ties'] += 1
+            outcome = 'wins' if diff > 0 else 'losses' if diff < 0 else 'ties'
+        differences[outcome] += 1
+        if 'family' in task:
+            family = families.setdefault(task['family'], dict(
+                tasks=0, initial_successes=0, final_successes=0,
+                paired_native={k: 0 for k in ('wins', 'losses', 'ties', 'without_native_pair')}))
+            family['tasks'] += 1
+            family['initial_successes'] += a['score']
+            family['final_successes'] += b['score']
+            family['paired_native'][outcome] += 1
     for result in rows:
         arm = result['arm']
         summary = by_arm[arm]
@@ -80,7 +89,8 @@ def _final_comparison(rows, tasks):
         summary['recorded_environment_steps'] = sum(e['recorded_steps'] for e in result['episodes'])
     return dict(arms=by_arm, paired_native={k: differences[k] for k in ('wins', 'ties', 'losses', 'without_native_pair')},
                 success_count_difference=by_arm['final']['scored_successes'] - by_arm['initial']['scored_successes'],
-                cumulative_successes=cumulative, game_groups=len(groups), results_by_game_group=groups)
+                cumulative_successes=cumulative, game_groups=len(groups), results_by_game_group=groups,
+                **({'by_family': families} if len(families) > 1 else {}))
 
 
 def _end_receipt(root, manifest, family):
@@ -139,6 +149,7 @@ def _run_round(root, family, index, cfg, manifest, shared):
     with open_stage(stage, cfg, manifest, tasks, learning_archive=archive,
                     shared_evolution_memory=shared) as adapter:
         state = run_batch(stage / 'batch', state=start, panels=current, adapter=adapter,
+                          protocol=manifest['protocol'],
                           budget=manifest['budget']['per_round'],
                           learning_history_tasks=previous, seed=_seed(manifest['seed'], family, 'batch', index))
     _checked_state(stage)

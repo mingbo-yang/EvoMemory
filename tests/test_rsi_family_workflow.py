@@ -4,7 +4,7 @@ import json
 import pytest
 
 from rsi_paired.audit import Audit, audit_run
-from rsi_paired.panel import SEQUENTIAL_PROTOCOL
+from rsi_paired.panel import HISTORICAL_SEQUENTIAL_PROTOCOL, SEQUENTIAL_PROTOCOL
 from rsi_paired.workflow import ContractError, InfrastructurePending, ReviewOutputError, digest, run_batch
 from tests.test_rsi_roles import roles
 from tests.test_rsi_workflow import Synthetic, panels, state
@@ -43,11 +43,14 @@ class FamilyFixture(Synthetic):
                 for row in super().evaluate(source, memory, tasks, seeds)]
 
 
-def test_sealed_gates_use_completed_learning_and_survive_restart(tmp_path):
+@pytest.mark.parametrize("protocol", [None, HISTORICAL_SEQUENTIAL_PROTOCOL], ids=["fresh-default", "historical"])
+def test_sealed_gates_use_registered_policy_and_survive_restart(tmp_path, protocol):
     first = reserves(1)
     adapter = FamilyFixture()
     root = tmp_path / "round" / "batch"
     args = dict(state=state(), panels=first, adapter=adapter, learning_history_tasks=[], seed=52)
+    if protocol is not None:
+        args["protocol"] = protocol
     adapter.interrupt = True
     with pytest.raises(InfrastructurePending, match="pre_review"):
         run_batch(root, **args)
@@ -55,7 +58,11 @@ def test_sealed_gates_use_completed_learning_and_survive_restart(tmp_path):
     selected_hash = digest(selected)
     assert len(adapter.learned) == 30 and not adapter.calls
     result = run_batch(root, **args)
-    assert result == run_batch(root, **args)
+    resume_args = {key: value for key, value in args.items() if key != "protocol"}
+    assert result == run_batch(root, **resume_args)
+    if protocol == HISTORICAL_SEQUENTIAL_PROTOCOL:
+        with pytest.raises(ValueError, match="Frozen"):
+            run_batch(root, **resume_args, protocol=SEQUENTIAL_PROTOCOL)
     assert len(adapter.learned) == len(set(adapter.learned)) == 30
     assert [row["task_id"] for row in result["ledger"]] == adapter.learned
     assert result["memory"]["learning"] == adapter.learned
@@ -69,7 +76,12 @@ def test_sealed_gates_use_completed_learning_and_survive_restart(tmp_path):
         rows = selected["panels"][phase]
         ids[phase] = [row["id"] for row in rows]
         historical = [learning[i] for i in ids[phase] if i in learning]
-        assert len(ids[phase]) == 30 and historical.count(1) == historical.count(0) == 6
+        assert len(ids[phase]) == 30
+        if protocol == HISTORICAL_SEQUENTIAL_PROTOCOL:
+            assert historical.count(1) == historical.count(0) == 6
+        else:
+            assert not historical
+            assert rows == first[phase]
         evaluated = json.loads((root / f"{phase}_results.json").read_text())
         assert all([r["task_id"] for r in c["evaluation"]] == ids[phase] for c in evaluated.values())
     assert not set(ids["primary"]).intersection(ids["meta"])
@@ -79,7 +91,12 @@ def test_sealed_gates_use_completed_learning_and_survive_restart(tmp_path):
     strata = {entry["task_id"]: entry["source"] for entry in selected["sampling"]["primary"]["entries"]}
     assert all(row["gate_source"] == strata[row["task_id"]] for slot in shared["primary"].values()
                for row in slot["evaluation"])
-    assert audit_run(root.parent)["status"] == "verified_workflow_only"
+    report = audit_run(root.parent)
+    assert report["status"] == "verified_workflow_only"
+    if protocol != HISTORICAL_SEQUENTIAL_PROTOCOL:
+        for phase in ("primary", "meta"):
+            assert report["panel_sampling"][phase]["entries"] == [
+                {"task_id": task_id, "source": "fresh"} for task_id in ids[phase]]
     shared_path = root / "H_shared.json"
     original = shared_path.read_bytes()
     shared["primary"]["parent"]["evaluation"][0]["gate_source"] = "incorrect"
@@ -88,6 +105,13 @@ def test_sealed_gates_use_completed_learning_and_survive_restart(tmp_path):
     shared_path.write_bytes(original)
     selected["panels"]["primary"].reverse()
     (root / "resolved_panels.json").write_text(json.dumps(selected))
+    if protocol != HISTORICAL_SEQUENTIAL_PROTOCOL:
+        # Even a matching rewritten parent checksum cannot legitimize a panel that
+        # differs from the registered order.
+        parent_path = root / "parent_snapshot.json"
+        parent = json.loads(parent_path.read_bytes())
+        parent["resolved_panels_hash"] = digest(selected)
+        parent_path.write_text(json.dumps(parent))
     assert audit_run(root.parent)["status"] == "audit_failed"
     with pytest.raises(ValueError, match="Frozen validation gates"):
         run_batch(root, **args)
@@ -98,9 +122,10 @@ def test_later_round_can_draw_prior_experience_but_never_relearn_a_game(tmp_path
     adapter.triggers = False
     first, second = reserves(1), reserves(2)
     start = run_batch(tmp_path / "r1" / "batch", state=state(), panels=first, adapter=adapter,
-                      learning_history_tasks=[])
+                      learning_history_tasks=[], protocol=HISTORICAL_SEQUENTIAL_PROTOCOL)
     root = tmp_path / "r2" / "batch"
-    args = dict(state=start, adapter=adapter, learning_history_tasks=first["learning"])
+    args = dict(state=start, adapter=adapter, learning_history_tasks=first["learning"],
+                protocol=HISTORICAL_SEQUENTIAL_PROTOCOL)
     with pytest.raises(ValueError, match="Repeated task"):
         run_batch(root, panels=first, **args)
     with pytest.raises(ValueError, match="historical tasks differ"):
@@ -208,7 +233,8 @@ class ReviewerFixture(FamilyFixture):
 def test_completed_meta_scores_follow_one_format_only_correction(tmp_path, mode, status):
     adapter = ReviewerFixture(mode)
     root = tmp_path / "batch"
-    args = dict(state=state(), panels=reserves(1), adapter=adapter, learning_history_tasks=[])
+    args = dict(state=state(), panels=reserves(1), adapter=adapter, learning_history_tasks=[],
+                protocol=HISTORICAL_SEQUENTIAL_PROTOCOL)
     if mode == "interrupted":
         with pytest.raises(InfrastructurePending, match="reviews/meta_correction"):
             run_batch(root, **args)

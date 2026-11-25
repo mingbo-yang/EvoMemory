@@ -25,12 +25,12 @@ def run(args, tasks):
     model_hash = digest(verify_model())
     tokenizer = Tokenizer()
     if domain == 'alfworld':
-        from evomem.alma_backend import ACTOR_PARAMETERS
+        from evomem.alma_backend import ALFWORLD_ACTION_POLICY, ALFWORLD_ACTOR_PARAMETERS
         from scripts.alma_feasibility import PIN, VENDOR
         from benchmarks.alfworld import official_panel
         from benchmarks.alfworld import panel
-        actor_parameters = ACTOR_PARAMETERS
-        prompt = file_hash(VENDOR/'envs_archive/prompts/alfworld_prompt.py')
+        actor_parameters = ALFWORLD_ACTOR_PARAMETERS
+        prompt = digest([file_hash(VENDOR/'envs_archive/prompts/alfworld_prompt.py'), ALFWORLD_ACTION_POLICY])
         benchmark = dict(name='EvoMemBench CrossEp-Emb', executor_commit=PIN,
                          protocol='EvoMemory online using official panel and ALMA actor',
                          panel_loader=file_hash(Path(panel.__file__)),

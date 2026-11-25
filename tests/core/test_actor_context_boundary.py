@@ -134,6 +134,10 @@ class ActorContextBoundaryTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(len(result['sent']),1)
                 self.assertEqual(result['sent'][0]['messages'],result['messages'])
                 self.assertEqual(result['sent'][0]['max_tokens'],512)
+                if environment == 'alfworld':
+                    self.assertEqual(result['sent'][0]['stop'], ['\n'])
+                else:
+                    self.assertNotIn('stop', result['sent'][0])
                 self.assertEqual(result['tokenizer_calls'],1)
                 self.assertEqual(result['context']['model_errors'],0)
                 self.assertEqual(result['rows'][0]['kind'],'model')
